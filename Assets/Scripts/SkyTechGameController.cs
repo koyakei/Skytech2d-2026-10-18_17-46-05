@@ -9,8 +9,18 @@ public class SkyTechGameController : MonoBehaviour
     [Header("=== 設定アセット ===")]
     public SkyTechSimConfig Config;
 
-    [Header("=== アシスト設定 ===")]
+    [Header("=== アシスト・マウス操作設定 ===")]
     public bool AutoAngulationAssist = false;
+    public bool UseMouseControl = true;
+
+    [Tooltip("マウスがこの距離(m)以下に台車へ近づくと脚を最大長(l_max)まで伸長")]
+    public float MouseFullExtendDist = 0.40f;
+
+    [Tooltip("マウスがこの距離(m)以上に台車から離れると脚を最小長(l_min)まで短縮")]
+    public float MouseFullFlexDist = 1.45f;
+
+    [Tooltip("脚の延長線上での左右チャタリング防止用微小デッドゾーン(m)")]
+    public float MouseLineDeadzone = 0.005f;
 
     public SimState CurrentState => _state;
     public SimInput CurrentInput => _input;
@@ -110,6 +120,7 @@ public class SkyTechGameController : MonoBehaviour
         {
             _input.u_ext_norm = 0f;
             _input.u_flex_norm = 0f;
+            _input.l1_target = 0f;
             _input.phi_lock_cmd = 0f;
             _input.phi_steer_cmd = 0f;
             _input.steer_neutral_cmd = false;
@@ -242,38 +253,119 @@ public class SkyTechGameController : MonoBehaviour
         }
 #endif
 
-        if (extPressed)
-        {
-            _input.u_ext_norm = Mathf.MoveTowards(_input.u_ext_norm, 1.0f, 45.0f * Time.deltaTime);
+        Vector2 mouseWorld = Vector2.zero;
+        bool hasMouseWorld = UseMouseControl && TryGetMouseWorldPosition(out mouseWorld);
 
-            if (!qHeld && !eHeld && _state.gripState != SkiGripState.Skidding)
+        // --- 1. 脚の伸縮入力（キーボード優先、未押下時はマウスと台車の距離で制御） ---
+        if (extPressed || flexPressed)
+        {
+            _input.l1_target = 0f;
+
+            if (extPressed)
             {
-                // ロック角の直立戻し速度を引き上げ(35 -> 120 deg/s)、さらに実際のロール角 theta1 が浅くなったらロック角もそこへ追従させる
-                float currentRollDeg = _state.theta1 * Mathf.Rad2Deg;
-                if (Mathf.Abs(currentRollDeg) < Mathf.Abs(_lockedHipDeg))
+                _input.u_ext_norm = Mathf.MoveTowards(_input.u_ext_norm, 1.0f, 45.0f * Time.deltaTime);
+
+                if (!qHeld && !eHeld && _state.gripState != SkiGripState.Skidding && _state.snow_stress_ratio < 0.9f)
                 {
-                    _lockedHipDeg = currentRollDeg;
+                    _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 35.0f * Time.deltaTime);
                 }
-                _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 120.0f * Time.deltaTime);
+            }
+            else
+            {
+                _input.u_ext_norm = 0f;
+            }
+
+            if (flexPressed)
+            {
+                _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, 1.0f, 24.0f * Time.deltaTime);
+            }
+            else
+            {
+                _input.u_flex_norm = 0f;
+            }
+        }
+        else if (hasMouseWorld && Config != null)
+        {
+            // 台車位置 P = (x_c, 0) とマウスワールド座標との距離
+            Vector2 carriagePos = new Vector2(_state.x_c, 0f);
+            float distToCarriage = Vector2.Distance(mouseWorld, carriagePos);
+
+            // 台車に近づけるほど l_max (伸長)、遠くするほど l_min (短縮)
+            float nearDist = Mathf.Max(0.05f, MouseFullExtendDist);
+            float farDist = Mathf.Max(nearDist + 0.10f, MouseFullFlexDist);
+            float tDist = Mathf.InverseLerp(nearDist, farDist, distToCarriage);
+            float targetL1 = Mathf.Lerp(Config.l_max, Config.l_min, tDist);
+            _input.l1_target = targetL1;
+
+            float lengthError = targetL1 - _state.l1;
+            const float lengthDeadband = 0.004f;
+
+            if (lengthError > lengthDeadband || targetL1 >= Config.l_max - 0.005f)
+            {
+                float extDrive = (targetL1 >= Config.l_max - 0.005f)
+                    ? 1.0f
+                    : Mathf.Clamp01(lengthError / 0.06f);
+
+                _input.u_ext_norm = Mathf.MoveTowards(_input.u_ext_norm, extDrive, 45.0f * Time.deltaTime);
+                _input.u_flex_norm = 0f;
+
+                if (_input.u_ext_norm > 0.1f && !qHeld && !eHeld && _state.gripState != SkiGripState.Skidding && _state.snow_stress_ratio < 0.9f)
+                {
+                    _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 35.0f * Time.deltaTime);
+                }
+            }
+            else if (lengthError < -lengthDeadband || targetL1 <= Config.l_min + 0.005f)
+            {
+                float flexDrive = (targetL1 <= Config.l_min + 0.005f)
+                    ? 1.0f
+                    : Mathf.Clamp01(-lengthError / 0.06f);
+
+                _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, flexDrive, 24.0f * Time.deltaTime);
+                _input.u_ext_norm = 0f;
+            }
+            else
+            {
+                _input.u_ext_norm = 0f;
+                _input.u_flex_norm = 0f;
             }
         }
         else
         {
+            _input.l1_target = 0f;
             _input.u_ext_norm = 0f;
-        }
-
-        if (flexPressed)
-        {
-            _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, 1.0f, 24.0f * Time.deltaTime);
-        }
-        else
-        {
             _input.u_flex_norm = 0f;
         }
 
+        // --- 2. 左右ステアリング入力（現在の脚の延長線の右側なら右矢印キー、左側なら左矢印キーと同じ動作） ---
         float steer = 0f;
-        if (IsKeyHeld(KeyCode.A, KeyCodeToKey(KeyCode.A)) || IsKeyHeld(KeyCode.LeftArrow, KeyCodeToKey(KeyCode.LeftArrow))) steer -= 1f;
-        if (IsKeyHeld(KeyCode.D, KeyCodeToKey(KeyCode.D)) || IsKeyHeld(KeyCode.RightArrow, KeyCodeToKey(KeyCode.RightArrow))) steer += 1f;
+        bool kbLeft = IsKeyHeld(KeyCode.A, KeyCodeToKey(KeyCode.A)) || IsKeyHeld(KeyCode.LeftArrow, KeyCodeToKey(KeyCode.LeftArrow));
+        bool kbRight = IsKeyHeld(KeyCode.D, KeyCodeToKey(KeyCode.D)) || IsKeyHeld(KeyCode.RightArrow, KeyCodeToKey(KeyCode.RightArrow));
+
+        if (kbLeft || kbRight)
+        {
+            if (kbLeft) steer -= 1f;
+            if (kbRight) steer += 1f;
+        }
+        else if (hasMouseWorld)
+        {
+            // 台車位置 P(x_c, 0) を通り、現在の脚方向 (sin(theta1), cos(theta1)) に伸びる直線に対する符号付き垂直距離
+            // d_right > 0: 脚の延長線の右側 -> 右矢印キー (steer = +1f)
+            // d_right < 0: 脚の延長線の左側 -> 左矢印キー (steer = -1f)
+            float dx = mouseWorld.x - _state.x_c;
+            float dy = mouseWorld.y;
+            float sin1 = Mathf.Sin(_state.theta1);
+            float cos1 = Mathf.Cos(_state.theta1);
+            float signedRightDist = dx * cos1 - dy * sin1;
+
+            if (signedRightDist > MouseLineDeadzone)
+            {
+                steer = 1f;
+            }
+            else if (signedRightDist < -MouseLineDeadzone)
+            {
+                steer = -1f;
+            }
+        }
 
         bool downPressed = IsKeyPressedThisFrame(KeyCode.DownArrow, KeyCodeToKey(KeyCode.DownArrow));
         bool downHeld = IsKeyHeld(KeyCode.DownArrow, KeyCodeToKey(KeyCode.DownArrow));
@@ -295,6 +387,91 @@ public class SkyTechGameController : MonoBehaviour
 
         _input.phi_steer_cmd = -steer;
         _input.steer_neutral_cmd = _isSteerNeutralActive;
+    }
+
+    private static bool TryGetMouseWorldPosition(out Vector2 worldPos)
+    {
+        worldPos = Vector2.zero;
+        Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
+        if (cam == null) return false;
+
+        Vector3 screenPos = Vector3.zero;
+        bool hasPos = false;
+
+        // 1. レガシー Input.mousePosition を優先的に試行
+        // macOS (Retina/High-DPI) 環境では、Unity 内部で Game View の物理ピクセル解像度 (cam.pixelRect) に
+        // 自動補正されるため、ScreenToWorldPoint との整合性が最も高くなります。
+        // ※ MacBook 内蔵トラックパッドでは Input.mousePresent が false を返す仕様があるため、
+        //    mousePresent による除外は行わず直接取得を試みます。
+        try
+        {
+            Vector3 legacyPos = Input.mousePosition;
+            if (!float.IsNaN(legacyPos.x) && !float.IsNaN(legacyPos.y))
+            {
+                screenPos = legacyPos;
+                hasPos = true;
+            }
+        }
+        catch
+        {
+            // Input System 専用モード等で例外が発生した場合はフォールバック
+            hasPos = false;
+        }
+
+#if ENABLE_INPUT_SYSTEM
+        // 2. New Input System からの取得（Input.mousePosition が無効な場合）
+        if (!hasPos)
+        {
+            // マウスだけでなくトラックパッドやペンなどの各種ポインターデバイスに対応
+            var pointer = (Pointer.current != null) ? Pointer.current : (Pointer)Mouse.current;
+            if (pointer != null)
+            {
+                Vector2 mp = pointer.position.ReadValue();
+                if (!float.IsNaN(mp.x) && !float.IsNaN(mp.y))
+                {
+                    screenPos = new Vector3(mp.x, mp.y, 0f);
+                    hasPos = true;
+
+                    // macOS (Retina) 環境のスケーリング補正:
+                    // pointer.position は論理ポイント単位 (Points) を返す場合があり、
+                    // cam.ScreenToWorldPoint は物理ピクセル (cam.pixelWidth) を想定しているため、
+                    // スケール比率（通常 2.0x）を検知して適切に物理ピクセルへスケーリングします。
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
+                    float retinaFactor = 1.0f;
+#if UNITY_EDITOR
+                    retinaFactor = UnityEditor.EditorGUIUtility.pixelsPerPoint;
+#else
+                    if (Display.main.systemWidth > 0 && Display.main.renderingWidth > 0)
+                    {
+                        retinaFactor = (float)Display.main.renderingWidth / Display.main.systemWidth;
+                    }
+                    else if (Screen.dpi > 160f)
+                    {
+                        retinaFactor = 2.0f;
+                    }
+#endif
+                    if (retinaFactor > 1.05f)
+                    {
+                        // 既に物理ピクセル単位になっている場合（2重適用）を防止
+                        if (screenPos.x * retinaFactor <= cam.pixelWidth * 1.05f &&
+                            screenPos.y * retinaFactor <= cam.pixelHeight * 1.05f)
+                        {
+                            screenPos.x *= retinaFactor;
+                            screenPos.y *= retinaFactor;
+                        }
+                    }
+#endif
+                }
+            }
+        }
+#endif
+
+        if (!hasPos) return false;
+
+        screenPos.z = -cam.transform.position.z;
+        Vector3 wp = cam.ScreenToWorldPoint(screenPos);
+        worldPos = new Vector2(wp.x, wp.y);
+        return true;
     }
 
 #if ENABLE_INPUT_SYSTEM
@@ -499,7 +676,16 @@ public class SkyTechGameController : MonoBehaviour
         _state = SkyTechPhysicsSolver.CreateInitialState(Config);
         _lockedHipDeg = 0f;
         _isSteerNeutralActive = false;
-        _input = new SimInput { u_ext_norm = 0f, u_flex_norm = 0f, phi_lock_cmd = 0f, phi_steer_cmd = 0f, steer_neutral_cmd = false, w_reset = false };
+        _input = new SimInput
+        {
+            u_ext_norm = 0f,
+            u_flex_norm = 0f,
+            l1_target = 0f,
+            phi_lock_cmd = 0f,
+            phi_steer_cmd = 0f,
+            steer_neutral_cmd = false,
+            w_reset = false
+        };
 
         CurrentTurnPeakEdgeDeg = 0f;
         CurrentTurnPeakCoMDeg = 0f;
