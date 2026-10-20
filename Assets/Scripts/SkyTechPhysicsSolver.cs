@@ -411,7 +411,6 @@ namespace SkyTechSimulator
                 fvFactor = eccBoost;
             }
 
-            // 脚が伸びきって重心がそれ以上動けない状態(l_max付近)では、脚を伸ばしても台車を押す余分な力は発生しない
             float strokeRoomGate = Mathf.Clamp01((cfg.l_max - s.l1) / 0.025f);
             float F_avail = (s.stamina > 0f) ? (F_iso * fvFactor * strokeRoomGate) : 0f;
             float u_norm = Mathf.Clamp01(input.u_ext_norm);
@@ -464,7 +463,6 @@ namespace SkyTechSimulator
 
             // =========================================================================
             // 4. 下部セグメント伸縮運動方程式 (l1, dl1) と 重心運動パワー P_leg_ext
-            //    ★重心の慣性運動(dl1 > 0)がなくなったら、脚をいくら伸ばしても台車を押すパワーは 0 W になる
             // =========================================================================
             float absTheta1 = Mathf.Min(Mathf.Abs(s.theta1), 82f * Mathf.Deg2Rad);
             float absPsi = Mathf.Abs(s.Psi_CoM);
@@ -520,8 +518,6 @@ namespace SkyTechSimulator
                 if (s.dl1 > 0f) s.dl1 = 0f;
             }
 
-            // ★重心が実際に動いている伸展速度 v_com_ext = max(0, dl1)
-            // 重心の動きが止まったら(dl1 <= 0)、スペースキーをいくら押し続けてもパワーは一切発生しない(0 W)
             float v_com_ext = Mathf.Max(0f, s.dl1);
             float refInertia = Mathf.Max(1.0f, cfg.M * l_eq_safe * l_eq_safe * 0.65f);
             float inertiaFactor = Mathf.Clamp(s.I_eff / refInertia, 0.4f, 1.6f);
@@ -541,10 +537,8 @@ namespace SkyTechSimulator
                 }
             }
 
-            // 仮想等尺性パワーを廃止し、重心が動いている実際の慣性仕事率のみを踏み込みパワーとする
             s.P_step_eff = s.P_leg_ext;
 
-            // 重心の伸展運動(dl1 > 0)がなくなったら、能動伸展による余分な押下力もF_legから除去する
             if (v_com_ext <= 0.001f)
             {
                 s.u_ext_actual = 0f;
@@ -552,7 +546,7 @@ namespace SkyTechSimulator
             }
 
             // =========================================================================
-            // 5. 雪面挫折 (Snow Shear Failure) によるスキッディング判定と実効遠心加速度 a_c
+            // 5. 雪面挫折 (Snow Shear Failure) 判定・キャリッジ車止め衝突・実効遠心加速度 a_c
             // =========================================================================
             float playRad = FreePlayDeg * Mathf.Deg2Rad;
             float G_steady = G_eq;
@@ -582,7 +576,6 @@ namespace SkyTechSimulator
                 s.lambda_sustain = Mathf.Max(1.0f, s.lambda_sustain);
             }
 
-            // --- 鉛直方向の押す力 F_vert と 雪面挫折負荷率 snow_stress_ratio ---
             float cosAbsTheta1 = Mathf.Max(0.15f, Mathf.Cos(absTheta1));
             float sinAbsTheta1 = Mathf.Sin(absTheta1);
             s.F_vert = s.F_leg * cosAbsTheta1;
@@ -602,7 +595,6 @@ namespace SkyTechSimulator
             float powerThreshold = Mathf.Max(150.0f, cfg.snowFailurePowerThreshold);
             float phi_power = s.P_step_eff / powerThreshold;
 
-            // 重心の慣性運動が止まって P_step_eff == 0 になれば、snow_stress_ratio も即座に 0 になる
             s.snow_stress_ratio = (s.P_step_eff > 1.0f) ? (phi_angle * phi_vert * phi_power) : 0f;
 
             if (s.snow_stress_ratio >= 1.0f)
@@ -612,11 +604,140 @@ namespace SkyTechSimulator
             }
             else
             {
-                // 重心の伸展が止まったら速やかにスキッドから回復させる
                 float recTau = (v_com_ext <= 0.01f) ? Mathf.Min(0.06f, cfg.skidRecoveryTau) : Mathf.Max(0.05f, cfg.skidRecoveryTau);
                 s.skid_intensity = Mathf.MoveTowards(s.skid_intensity, 0f, (dt / recTau));
             }
 
+            // --- キャリッジ水平軌道 (x_c, v_c) と車止め急停止による慣性撃力の算出 ---
+            float m_c = Mathf.Max(1.0f, cfg.carriageMass);
+            float rollAngle = Mathf.Abs(s.theta1);
+            float comAngle = Mathf.Abs(s.Psi_CoM);
+            float effectiveAngle = Mathf.Max(rollAngle, comAngle);
+            float deadzoneRad = 0.2f * Mathf.Deg2Rad;
+            const float C_rail = 75.0f;
+
+            float uprightGate = Mathf.Exp(-Mathf.Pow(effectiveAngle / (3.5f * Mathf.Deg2Rad), 2f));
+            float tuckSpeed = Mathf.Max(0f, -s.dl1) + 0.8f * u_flex;
+            float k_return = u_flex * uprightGate * cfg.tuckCenterSpringK * (1.0f + cfg.tuckVelocityReturnBoost * tuckSpeed);
+            float F_center_return = -k_return * s.x_c;
+
+            float c_critical = 2.0f * Mathf.Sqrt(m_c * Mathf.Max(1.0f, k_return)) * cfg.tuckCenterDampingRatio;
+            float c_effective = Mathf.Lerp(C_rail, c_critical, u_flex * uprightGate);
+
+            float halfRail = cfg.W_rail * 0.5f;
+            bool wasAtRailLimit = Mathf.Abs(s.x_c) >= (halfRail - 1e-4f);
+            float ddx_c_impact = 0f;
+
+            if (effectiveAngle <= deadzoneRad && Mathf.Abs(u_x) < 0.01f && Mathf.Abs(s.x_c) < 0.02f)
+            {
+                s.v_c_target = 0f;
+                s.v_c_recoil_max = 0f;
+                s.skid_pushback_force = 0f;
+                float ddx_c_stop = -(C_rail / m_c) * s.v_c;
+                s.v_c += ddx_c_stop * dt;
+                s.x_c += s.v_c * dt;
+                if (Mathf.Abs(s.v_c) < 0.01f) s.v_c = 0f;
+            }
+            else
+            {
+                const float midBankScale = 0.35f;
+                const float deepBankBoost = 2.20f;
+                const float baseGain5Deg = 1.217f;
+
+                float sinRoll = Mathf.Sin(effectiveAngle);
+                float angleShapeFactor = Mathf.Lerp(1.0f, midBankScale, Mathf.Clamp01((effectiveAngle - 5f * Mathf.Deg2Rad) / (25f * Mathf.Deg2Rad)))
+                                       + deepBankBoost * (sinRoll * sinRoll * sinRoll);
+
+                float tanAngleDrive = (Mathf.Abs(s.theta1) >= Mathf.Abs(s.Psi_CoM))
+                    ? G_steady
+                    : (s.y_CoM / Mathf.Max(0.18f, s.z_CoM));
+
+                float angleBaseAccel = tanAngleDrive * cfg.g;
+                s.v_c_target = angleBaseAccel * baseGain5Deg * angleShapeFactor;
+
+                float carvingRetention = (s.gripState == SkiGripState.HipCrash || s.gripState == SkiGripState.BootOut)
+                    ? 0.0f
+                    : Mathf.Lerp(1.0f, cfg.skidGripMultiplier, Mathf.Clamp01(s.skid_intensity));
+
+                // 車止めに引っかかって外向きに押されている状態ではカービング駆動力は発生しない
+                if (wasAtRailLimit && (s.x_c * s.v_c_target > 0f))
+                {
+                    carvingRetention = 0f;
+                }
+
+                float F_drive = C_rail * s.v_c_target * carvingRetention;
+
+                float R_com_sq = Mathf.Max(0.15f, s.R_CoM * s.R_CoM);
+                float M_inertia = s.I_eff / R_com_sq;
+                float inertiaMassRatio = M_inertia / (m_c + M_inertia);
+
+                float comHorizExtVel = v_com_ext * Mathf.Sin(absTheta1);
+                s.v_c_recoil_max = inertiaMassRatio * comHorizExtVel;
+
+                float dirSign = (Mathf.Abs(s.theta1) > 0.001f) ? Mathf.Sign(s.theta1) : Mathf.Sign(s.y_CoM);
+
+                if (s.gripState == SkiGripState.Skidding && s.P_leg_ext > 1.0f && v_com_ext > 0.001f)
+                {
+                    float dynamicFootForce = (s.P_leg_ext / Mathf.Max(0.3f, v_max_eff)) * Mathf.Sin(absTheta1);
+                    s.skid_pushback_force = -dirSign * cfg.carriagePushbackGain * inertiaMassRatio * dynamicFootForce * s.skid_intensity;
+                }
+                else
+                {
+                    s.skid_pushback_force = 0f;
+                }
+
+                float ddx_c = (F_drive + s.skid_pushback_force + F_center_return - c_effective * s.v_c) / m_c;
+
+                if (wasAtRailLimit)
+                {
+                    float railSign = Mathf.Sign(s.x_c);
+                    if (railSign * ddx_c >= 0f)
+                    {
+                        // 車止めに押し付けられている間は外向きへの移動を完全に拘束
+                        ddx_c = 0f;
+                        s.v_c = 0f;
+                        s.x_c = railSign * halfRail;
+                    }
+                    else
+                    {
+                        s.v_c += ddx_c * dt;
+                        s.x_c += s.v_c * dt;
+                    }
+                }
+                else
+                {
+                    s.v_c += ddx_c * dt;
+
+                    if (Mathf.Abs(dirSign) > 0.001f)
+                    {
+                        float v_opp = -dirSign * s.v_c;
+                        if (v_opp > s.v_c_recoil_max)
+                        {
+                            s.v_c = -dirSign * s.v_c_recoil_max;
+                        }
+                    }
+
+                    s.x_c += s.v_c * dt;
+                }
+            }
+
+            // 車止め衝突時の急停止処理と慣性減速度 ddx_c_impact の算出
+            if (Mathf.Abs(s.x_c) >= halfRail)
+            {
+                float railSign = Mathf.Sign(s.x_c);
+                s.x_c = railSign * halfRail;
+                if (railSign * s.v_c > 0f)
+                {
+                    float v_c_before = s.v_c;
+                    s.v_c = 0f;
+                    float delta_v_c = s.v_c - v_c_before; // -v_c_before
+                    ddx_c_impact = delta_v_c / dt;
+                }
+            }
+
+            bool isAtRailLimit = Mathf.Abs(s.x_c) >= (halfRail - 1e-4f);
+
+            // --- グリップ状態判定と仮想遠心加速度 a_c ---
             float N_min = cfg.N_min_G * mg;
             float gripFactor = 1.0f;
 
@@ -628,12 +749,12 @@ namespace SkyTechSimulator
             else if (Mathf.Abs(s.theta1) >= cfg.theta_bootOutDeg * Mathf.Deg2Rad)
             {
                 s.gripState = SkiGripState.BootOut;
-                gripFactor = 0.1f;
+                gripFactor = 0f;
             }
-            else if (Mathf.Abs(s.x_c) >= cfg.W_rail * 0.5f)
+            else if (isAtRailLimit)
             {
                 s.gripState = SkiGripState.RailLimitHit;
-                gripFactor = 0.5f;
+                gripFactor = 0f;
             }
             else if (s.snow_stress_ratio >= 1.0f || s.skid_intensity > 0.15f)
             {
@@ -651,16 +772,27 @@ namespace SkyTechSimulator
                 gripFactor = 1.0f;
             }
 
-            float a_c_target = (s.G_base * cfg.g) * s.lambda_sustain * gripFactor;
-            float fastLag = Mathf.Min(0.015f, cfg.tau_G_lag);
-            s.a_c += ((a_c_target - s.a_c) / Mathf.Max(0.005f, fastLag)) * dt;
+            if (s.gripState == SkiGripState.RailLimitHit ||
+                s.gripState == SkiGripState.BootOut ||
+                s.gripState == SkiGripState.HipCrash)
+            {
+                // 車止め停止時およびクラッシュ時は仮想遠心力を即座に 0 にする
+                s.a_c = 0f;
+                s.kappa = 0f;
+                s.kappa_target = 0f;
+            }
+            else
+            {
+                float a_c_target = (s.G_base * cfg.g) * s.lambda_sustain * gripFactor;
+                float fastLag = Mathf.Min(0.015f, cfg.tau_G_lag);
+                s.a_c += ((a_c_target - s.a_c) / Mathf.Max(0.005f, fastLag)) * dt;
 
-            s.kappa = s.a_c / Mathf.Max(4.0f, s.V * s.V);
-            s.kappa_target = a_c_target / Mathf.Max(4.0f, s.V * s.V);
+                s.kappa = s.a_c / Mathf.Max(4.0f, s.V * s.V);
+                s.kappa_target = a_c_target / Mathf.Max(4.0f, s.V * s.V);
+            }
 
             // =========================================================================
             // 6. ブーツ支点まわりのロール運動方程式 (theta1, omega1)
-            //    ★重心が動いているとき(v_com_ext > 0)のみ伸展起き上がりトルクが発生する
             // =========================================================================
             if (input.w_reset)
             {
@@ -677,14 +809,17 @@ namespace SkyTechSimulator
             {
                 float tau_gravity = mg * s.y_CoM;
                 float tau_centrifugal = -cfg.M * s.a_c * s.z_CoM_ref;
+
+                // 車止め衝突で台車が急停止した慣性力 (-M * ddx_c_impact * z_CoM) によるつんのめり撃力トルク
+                // Δω_1 = -(M * z_CoM / I_eff) * Δv_c
+                float tau_rail_impact = -cfg.M * ddx_c_impact * s.z_CoM;
+
                 float tau_shift_drive = cfg.comShiftRollDriveGain * mg * s.dy_cmd;
                 float tau_hip_reaction = cfg.hipReactionGain * s.tau_hip_steer;
 
-                // ★重心が実際に動いているパワー P_leg_ext があるときのみ起き上がりトルクが発生する
-                // 脚が伸びきって重心の慣性運動がなくなったら(v_com_ext == 0)、いくら脚を伸ばそうとしても起き上がりトルクは 0
                 float skidRightingPenalty = 1.0f - 0.85f * Mathf.Clamp01(s.skid_intensity);
                 float activeExtMotionGate = Mathf.Clamp01(v_com_ext / 0.25f);
-                float tau_ext_righting = -u_norm * activeExtMotionGate * skidRightingPenalty * (
+                float tau_ext_righting = (s.gripState == SkiGripState.RailLimitHit) ? 0f : -u_norm * activeExtMotionGate * skidRightingPenalty * (
                     cfg.extRightingTorqueGain * s.u_ext_actual * s.l1 * Mathf.Sin(s.theta1)
                     + cfg.extVelocityRightingGain * mg * v_com_ext * Mathf.Sin(s.theta1)
                 );
@@ -693,21 +828,41 @@ namespace SkyTechSimulator
                 float tuckVel = Mathf.Max(0f, -s.dl1);
                 float tau_tuck_centering = -u_flex * uprightFactorForTuck * cfg.tuckRollCenteringGain * cfg.M * (0.35f + tuckVel) * s.theta1;
 
+                // 角度固定サーボ：エッジ支持を失った状態や、設定角度より深く外側へ倒れ込む動きに対しては働かないようにする
                 float tau_lock_servo = 0f;
-                if (Mathf.Abs(input.phi_lock_cmd) > 0.001f && shiftActivity < 0.05f)
+                if (s.gripState == SkiGripState.Carving && Mathf.Abs(input.phi_lock_cmd) > 0.001f && shiftActivity < 0.05f)
                 {
-                    float lockHoldWeight = 1.0f - 0.90f * Mathf.Max(u_norm * activeExtMotionGate * skidRightingPenalty, u_flex * uprightFactorForTuck);
-                    tau_lock_servo = 450.0f * lockHoldWeight * (input.phi_lock_cmd - s.theta1);
+                    float lockError = input.phi_lock_cmd - s.theta1;
+                    bool isPullingBackFromDeeperLean = (s.theta1 * lockError) < 0f;
+                    if (!isPullingBackFromDeeperLean)
+                    {
+                        float lockHoldWeight = 1.0f - 0.90f * Mathf.Max(u_norm * activeExtMotionGate * skidRightingPenalty, u_flex * uprightFactorForTuck);
+                        tau_lock_servo = 450.0f * lockHoldWeight * lockError;
+                    }
                 }
 
+                // ロール減衰：二乗ダンピングを廃止し、支持喪失・倒れ込み時は減衰を最小限にして重力で自然に角加速させる
                 bool isRighting = (s.theta1 * s.omega1) < 0f;
-                float rightingDampScale = isRighting ? (1.0f - 0.55f * Mathf.Max(u_norm * activeExtMotionGate, u_flex)) : 1.0f;
+                float dampingLinear;
+                if (s.gripState == SkiGripState.RailLimitHit ||
+                    s.gripState == SkiGripState.BootOut ||
+                    s.gripState == SkiGripState.HipCrash ||
+                    s.gripState == SkiGripState.Unweighted)
+                {
+                    dampingLinear = 1.5f;
+                }
+                else if (!isRighting)
+                {
+                    dampingLinear = Mathf.Min(cfg.gamma_roll, 6.0f);
+                }
+                else
+                {
+                    float rightingDampScale = 1.0f - 0.55f * Mathf.Max(u_norm * activeExtMotionGate, u_flex);
+                    dampingLinear = Mathf.Min(cfg.gamma_roll, 12.0f) * rightingDampScale;
+                }
+                float tau_damping = -dampingLinear * s.omega1;
 
-                float dampingLinear = Mathf.Max(35.0f, cfg.gamma_roll * 2.2f) * rightingDampScale;
-                float dampingQuad = Mathf.Max(30.0f, cfg.gamma_quad * 3.0f) * rightingDampScale;
-                float tau_damping = -dampingLinear * s.omega1 - dampingQuad * Mathf.Abs(s.omega1) * s.omega1;
-
-                float domega1 = (tau_gravity + tau_centrifugal + tau_shift_drive + tau_hip_reaction
+                float domega1 = (tau_gravity + tau_centrifugal + tau_rail_impact + tau_shift_drive + tau_hip_reaction
                                + tau_ext_righting + tau_tuck_centering + tau_lock_servo + tau_damping) / s.I_eff;
                 s.omega1 += domega1 * dt;
                 s.theta1 += s.omega1 * dt;
@@ -750,111 +905,20 @@ namespace SkyTechSimulator
             float y_CoM_unshifted = L1 * Mathf.Sin(s.theta1 - delta_theta1_cmd) + L2 * sin2_ref;
             s.dy_actual = s.y_CoM - y_CoM_unshifted;
 
+            if (s.z_H < cfg.z_H_min)
+            {
+                s.gripState = SkiGripState.HipCrash;
+                s.a_c = 0f;
+            }
+            else if (Mathf.Abs(s.theta1) >= cfg.theta_bootOutDeg * Mathf.Deg2Rad)
+            {
+                s.gripState = SkiGripState.BootOut;
+                s.a_c = 0f;
+            }
+
             // =========================================================================
-            // 7. キャリッジ水平軌道 (x_c, v_c) と進行方向速度 V(t)
-            //    ★台車が反対側へ行ける速度・力を「重心が動く慣性モーメント I_eff の反作用」以下に厳密制限
-            //    ★重心の慣性モーメント（動き）がなくなったら、台車を押す反力は 0 N になる
+            // 7. 進行方向速度 V(t)
             // =========================================================================
-            float m_c = Mathf.Max(1.0f, cfg.carriageMass);
-            float rollAngle = Mathf.Abs(s.theta1);
-            float comAngle = Mathf.Abs(s.Psi_CoM);
-            float effectiveAngle = Mathf.Max(rollAngle, comAngle);
-            float deadzoneRad = 0.2f * Mathf.Deg2Rad;
-            const float C_rail = 75.0f;
-
-            float uprightGate = Mathf.Exp(-Mathf.Pow(effectiveAngle / (3.5f * Mathf.Deg2Rad), 2f));
-            float tuckSpeed = Mathf.Max(0f, -s.dl1) + 0.8f * u_flex;
-            float k_return = u_flex * uprightGate * cfg.tuckCenterSpringK * (1.0f + cfg.tuckVelocityReturnBoost * tuckSpeed);
-            float F_center_return = -k_return * s.x_c;
-
-            float c_critical = 2.0f * Mathf.Sqrt(m_c * Mathf.Max(1.0f, k_return)) * cfg.tuckCenterDampingRatio;
-            float c_effective = Mathf.Lerp(C_rail, c_critical, u_flex * uprightGate);
-
-            if (effectiveAngle <= deadzoneRad && Mathf.Abs(u_x) < 0.01f && Mathf.Abs(s.x_c) < 0.02f)
-            {
-                s.v_c_target = 0f;
-                s.v_c_recoil_max = 0f;
-                s.skid_pushback_force = 0f;
-                float ddx_c_stop = -(C_rail / m_c) * s.v_c;
-                s.v_c += ddx_c_stop * dt;
-                s.x_c += s.v_c * dt;
-                if (Mathf.Abs(s.v_c) < 0.01f) s.v_c = 0f;
-            }
-            else
-            {
-                const float midBankScale = 0.35f;
-                const float deepBankBoost = 2.20f;
-                const float baseGain5Deg = 1.217f;
-
-                float sinRoll = Mathf.Sin(effectiveAngle);
-                float angleShapeFactor = Mathf.Lerp(1.0f, midBankScale, Mathf.Clamp01((effectiveAngle - 5f * Mathf.Deg2Rad) / (25f * Mathf.Deg2Rad)))
-                                       + deepBankBoost * (sinRoll * sinRoll * sinRoll);
-
-                float tanAngleDrive = (Mathf.Abs(s.theta1) >= Mathf.Abs(s.Psi_CoM))
-                    ? G_steady
-                    : (s.y_CoM / Mathf.Max(0.18f, s.z_CoM));
-
-                float angleBaseAccel = tanAngleDrive * cfg.g;
-                s.v_c_target = angleBaseAccel * baseGain5Deg * angleShapeFactor;
-
-                // カービング駆動力（雪面挫折スキッディング時はエッジの引っかかりが失われて減速する）
-                float carvingRetention = (s.gripState == SkiGripState.HipCrash || s.gripState == SkiGripState.BootOut)
-                    ? 0.05f
-                    : Mathf.Lerp(1.0f, cfg.skidGripMultiplier, Mathf.Clamp01(s.skid_intensity));
-
-                float F_drive = C_rail * s.v_c_target * carvingRetention;
-
-                // ★重心の慣性モーメント I_eff から決まる等価慣性質量 M_inertia と反作用上限速度 v_c_recoil_max
-                float R_com_sq = Mathf.Max(0.15f, s.R_CoM * s.R_CoM);
-                float M_inertia = s.I_eff / R_com_sq;
-                float inertiaMassRatio = M_inertia / (m_c + M_inertia);
-
-                // 重心が脚の伸展によって実際に水平方向へ動く慣性速度
-                float comHorizExtVel = v_com_ext * Mathf.Sin(absTheta1);
-
-                // 運動量保存則により、台車が反対側へ動ける最大速度は重心の慣性モーメント反作用速度を超えることはない
-                s.v_c_recoil_max = inertiaMassRatio * comHorizExtVel;
-
-                float dirSign = (Mathf.Abs(s.theta1) > 0.001f) ? Mathf.Sign(s.theta1) : Mathf.Sign(s.y_CoM);
-
-                // ★重心が動いているパワー P_leg_ext があるときのみ押し負け反力が発生（重心の慣性がなくなったら 0 N）
-                if (s.gripState == SkiGripState.Skidding && s.P_leg_ext > 1.0f && v_com_ext > 0.001f)
-                {
-                    float dynamicFootForce = (s.P_leg_ext / Mathf.Max(0.3f, v_max_eff)) * Mathf.Sin(absTheta1);
-                    s.skid_pushback_force = -dirSign * cfg.carriagePushbackGain * inertiaMassRatio * dynamicFootForce * s.skid_intensity;
-                }
-                else
-                {
-                    s.skid_pushback_force = 0f;
-                }
-
-                float ddx_c = (F_drive + s.skid_pushback_force + F_center_return - c_effective * s.v_c) / m_c;
-                s.v_c += ddx_c * dt;
-
-                // ★ハード制限：台車の反対側（-dirSign方向）への速度は、重心が動く慣性モーメントの反作用速度 v_c_recoil_max を絶対に超えない
-                if (Mathf.Abs(dirSign) > 0.001f)
-                {
-                    float v_opp = -dirSign * s.v_c;
-                    if (v_opp > s.v_c_recoil_max)
-                    {
-                        s.v_c = -dirSign * s.v_c_recoil_max;
-                    }
-                }
-
-                s.x_c += s.v_c * dt;
-            }
-
-            float halfRail = cfg.W_rail * 0.5f;
-            if (Mathf.Abs(s.x_c) > halfRail)
-            {
-                s.x_c = Mathf.Sign(s.x_c) * halfRail;
-                s.v_c = -0.4f * s.v_c;
-                if (s.gripState != SkiGripState.BootOut && s.gripState != SkiGripState.HipCrash)
-                {
-                    s.gripState = SkiGripState.RailLimitHit;
-                }
-            }
-
             float alphaRad = cfg.alphaDeg * Mathf.Deg2Rad;
             float gravityDrive = cfg.g * Mathf.Sin(alphaRad) * 0.35f;
             float frictionMult = (s.gripState == SkiGripState.Skidding) ? 3.0f : 1.0f;
