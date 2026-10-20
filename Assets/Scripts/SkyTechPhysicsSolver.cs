@@ -62,8 +62,12 @@ namespace SkyTechSimulator
 
         /// <summary>(kg*m^2) 現在の重心まわりの実効慣性モーメント I_eff</summary>
         public float I_eff;
-        /// <summary>(N) 鉛直方向の押す力 F_leg * cos(theta1)</summary>
+        /// <summary>(N) 鉛直下方向の荷重（2G上方加速での伸び切り時は -1G = -M*g）</summary>
         public float F_vert;
+        /// <summary>(G) 重心の鉛直上方加速度 G_z_up</summary>
+        public float G_z_up;
+        /// <summary>(N) 横方向の重心移動による横方向踏み込み力</summary>
+        public float F_lat_step;
         /// <summary>(W) 雪面挫折判定用の実効踏み込みパワー（重心が動いているときのみ発生）</summary>
         public float P_step_eff;
         /// <summary>[0..2+] 雪面挫折限界に対する現在の負荷率（1.0以上でスキッディング）</summary>
@@ -72,7 +76,7 @@ namespace SkyTechSimulator
         public float skid_intensity;
         /// <summary>(m/s) 角度依存の台車目標移動速度</summary>
         public float v_c_target;
-        /// <summary>(m/s) 重心の慣性モーメント反作用による台車の反対側への最大許容速度</summary>
+        /// <summary>(m/s) 重心の慣性モーメント反作用による台車の反対側への最大許容速度（テレメトリ用）</summary>
         public float v_c_recoil_max;
         /// <summary>(N) 雪面挫折により台車が脚に押し負ける反力</summary>
         public float skid_pushback_force;
@@ -152,6 +156,8 @@ namespace SkyTechSimulator
             s.F_compress = cfg.M * cfg.g;
             s.F_leg = cfg.M * cfg.g;
             s.F_vert = cfg.M * cfg.g;
+            s.G_z_up = 0f;
+            s.F_lat_step = 0f;
             s.P_step_eff = 0f;
             s.snow_stress_ratio = 0f;
             s.skid_intensity = 0f;
@@ -275,6 +281,8 @@ namespace SkyTechSimulator
             float L2 = (cfg.m2 / totalMass) * cfg.l2;
             float m2_l2 = cfg.m2 * cfg.l2;
             float I2_hip = Mathf.Max(0.5f, cfg.m2 * cfg.l2 * cfg.l2);
+
+            float prev_y_CoM = s.y_CoM;
 
             // ブーツ支点まわりの合成慣性モーメント I_eff
             s.I_eff = cfg.m1 * cfg.c1 * cfg.c1 * s.l1 * s.l1
@@ -462,19 +470,22 @@ namespace SkyTechSimulator
             s.F_leg = Mathf.Max(0f, passiveForce + s.u_ext_actual);
 
             // =========================================================================
-            // 4. 下部セグメント伸縮運動方程式 (l1, dl1) と 重心運動パワー P_leg_ext
+            // 4. 下部セグメント伸縮運動方程式 (l1, dl1) と 鉛直上方加速度 G_z_up・横方向踏み込み F_lat_step
             // =========================================================================
             float absTheta1 = Mathf.Min(Mathf.Abs(s.theta1), 82f * Mathf.Deg2Rad);
+            float cosAbsTheta1 = Mathf.Max(0.15f, Mathf.Cos(absTheta1));
+            float sinAbsTheta1 = Mathf.Sin(absTheta1);
             float absPsi = Mathf.Abs(s.Psi_CoM);
             float currentLatG = Mathf.Abs(s.a_c) / cfg.g;
 
             s.F_compress = mg * (Mathf.Cos(absPsi) + currentLatG * Mathf.Sin(absPsi));
             s.F_compress = Mathf.Max(0.1f * mg, s.F_compress);
 
+            float ddl1 = 0f;
             if (u_flex > 0f)
             {
-                float ddl1_tuck = (passiveForce - s.F_compress) / cfg.M;
-                s.dl1 += ddl1_tuck * dt;
+                ddl1 = (passiveForce - s.F_compress) / cfg.M;
+                s.dl1 += ddl1 * dt;
                 if (s.dl1 > 0f) s.dl1 = 0f;
                 s.l1 += s.dl1 * dt;
             }
@@ -483,7 +494,7 @@ namespace SkyTechSimulator
                 float l1_prev = s.l1;
 
                 float effectiveLoad = (u_norm <= 0f && s.l1 <= l_hold) ? mg : s.F_compress;
-                float ddl1 = (s.F_leg - effectiveLoad) / cfg.M;
+                ddl1 = (s.F_leg - effectiveLoad) / cfg.M;
                 s.dl1 += ddl1 * dt;
 
                 if (u_norm <= 0f && s.l1 >= l_hold && s.dl1 > 0f)
@@ -519,6 +530,26 @@ namespace SkyTechSimulator
             }
 
             float v_com_ext = Mathf.Max(0f, s.dl1);
+
+            // --- 重心の鉛直上方加速度 G_z_up の算出 ---
+            // 伸展ストローク中の鉛直上方加速度および上昇速度の運動エネルギーから G_z_up を算出
+            // 0G上方加速 -> 鉛直下方向に +1G, 1G上方加速 -> 0G, 2G上方加速で伸び切り -> -1G
+            float v_z_ext = v_com_ext * cosAbsTheta1;
+            float strokeRef = Mathf.Max(0.12f, dropHold);
+            float G_z_kin = (v_z_ext * v_z_ext) / (2.0f * cfg.g * strokeRef);
+            float G_z_inst = (v_com_ext > 0.001f) ? (Mathf.Max(0f, ddl1) * cosAbsTheta1 / cfg.g) : 0f;
+
+            if (v_com_ext > 0.001f && u_norm > 0f)
+            {
+                float currentUpG = Mathf.Max(G_z_kin, G_z_inst * 0.55f);
+                s.G_z_up = Mathf.Max(s.G_z_up, currentUpG);
+            }
+            else
+            {
+                // 伸び切った後（または非伸展時）は重力(1G)によって鉛直上方加速の慣性が減衰し 0G へ戻る
+                s.G_z_up = Mathf.MoveTowards(s.G_z_up, 0f, 3.8f * dt);
+            }
+
             float refInertia = Mathf.Max(1.0f, cfg.M * l_eq_safe * l_eq_safe * 0.65f);
             float inertiaFactor = Mathf.Clamp(s.I_eff / refInertia, 0.4f, 1.6f);
 
@@ -542,11 +573,50 @@ namespace SkyTechSimulator
             if (v_com_ext <= 0.001f)
             {
                 s.u_ext_actual = 0f;
-                s.F_leg = Mathf.Max(0f, passiveForce);
+            }
+
+            // --- 鉛直下方向荷重 F_vert と 横方向の重心移動による横方向踏み込み F_lat_step ---
+            // xi_ext: l_hold 以下で 0、伸び切り領域で 1
+            float xi_ext = 1.0f - phi_support;
+            float vertSupportG;
+            if (u_norm > 0f)
+            {
+                // スペースキー押下中：鉛直上方加速度 s.G_z_up に応じて鉛直下方向荷重を決定
+                // (G_z_up = 0G -> +1G, G_z_up = 1G -> 0G, G_z_up = 2G -> -1G)
+                vertSupportG = (1.0f - xi_ext * s.G_z_up) * (1.0f - 0.85f * u_flex);
+            }
+            else
+            {
+                vertSupportG = (phi_support - xi_ext * s.G_z_up) * (1.0f - 0.85f * u_flex);
+            }
+
+            float F_vert_passive = mg * vertSupportG + stanceReturnForce - dampingMult * c_ecc * s.dl1 * cosAbsTheta1;
+            if (u_flex > 0f)
+            {
+                F_vert_passive -= u_flex * (0.95f + cfg.releaseTuckPullG) * mg;
+            }
+
+            // 鉛直下方向の押す力 F_vert（2G上方加速での伸び切り時は -1G = -mg となる）
+            s.F_vert = F_vert_passive + s.u_ext_actual * cosAbsTheta1;
+
+            // 横方向の重心移動速度・伸展成分を横方向の踏み込み力 F_lat_step に反映
+            float v_y_ext = v_com_ext * sinAbsTheta1;
+            float a_y_ext = Mathf.Max(0f, ddl1) * sinAbsTheta1;
+            float dy_shift_rate = Mathf.Abs(u_x - s.u_shift_filtered) / tauShift * maxShiftDesign;
+            s.F_lat_step = s.u_ext_actual * sinAbsTheta1
+                         + cfg.M * (a_y_ext + 2.5f * v_y_ext + 1.5f * dy_shift_rate)
+                         + cfg.M * Mathf.Abs(s.a_c) * Mathf.Sin(absPsi);
+
+            // 脚軸・エッジへの総合踏み込み力 F_leg（鉛直成分 + 横方向踏み込み成分）
+            float F_vert_pos = Mathf.Max(0f, s.F_vert);
+            s.F_leg = F_vert_pos * cosAbsTheta1 + s.F_lat_step * sinAbsTheta1;
+            if (F_vert_pos > 0f && s.F_leg < F_vert_pos)
+            {
+                s.F_leg = F_vert_pos;
             }
 
             // =========================================================================
-            // 5. 雪面挫折 (Snow Shear Failure) 判定・キャリッジ車止め衝突・実効遠心加速度 a_c
+            // 5. 雪面挫折 (Snow Shear Failure) 判定・キャリッジ移動・実効遠心加速度 a_c
             // =========================================================================
             float playRad = FreePlayDeg * Mathf.Deg2Rad;
             float G_steady = G_eq;
@@ -562,7 +632,7 @@ namespace SkyTechSimulator
             float F_req_eff = Mathf.Max(0.35f * mg, cfg.loadSustainScale * F_req_ideal);
             float loadRatio = s.F_leg / F_req_eff;
 
-            float maxLambda = Mathf.Lerp(1.0f, Mathf.Max(1.2f, cfg.lambda_max), Mathf.Clamp01(s.P_leg_ext / 600.0f));
+            float maxLambda = Mathf.Lerp(1.0f, Mathf.Max(1.2f, cfg.lambda_max), Mathf.Clamp01((s.P_leg_ext + s.F_lat_step * v_y_ext) / 600.0f));
             s.lambda_sustain = Mathf.Clamp(Mathf.Pow(Mathf.Clamp(loadRatio, 0f, 1.8f), cfg.loadSustainPower_q), 0f, maxLambda);
 
             bool isCoMOffCenter = (absPsi > 2.5f * Mathf.Deg2Rad) || (absTheta1 > 2.5f * Mathf.Deg2Rad);
@@ -575,10 +645,6 @@ namespace SkyTechSimulator
             {
                 s.lambda_sustain = Mathf.Max(1.0f, s.lambda_sustain);
             }
-
-            float cosAbsTheta1 = Mathf.Max(0.15f, Mathf.Cos(absTheta1));
-            float sinAbsTheta1 = Mathf.Sin(absTheta1);
-            s.F_vert = s.F_leg * cosAbsTheta1;
 
             float minSkidRad = Mathf.Max(3.0f, cfg.skidMinAngleDeg) * Mathf.Deg2Rad;
             float refSkidRad = Mathf.Max(cfg.skidMinAngleDeg + 5.0f, cfg.skidRefAngleDeg) * Mathf.Deg2Rad;
@@ -622,18 +688,20 @@ namespace SkyTechSimulator
             float F_center_return = -k_return * s.x_c;
 
             float c_critical = 2.0f * Mathf.Sqrt(m_c * Mathf.Max(1.0f, k_return)) * cfg.tuckCenterDampingRatio;
-            float c_effective = Mathf.Lerp(C_rail, c_critical, u_flex * uprightGate);
+            // レール粘性ブレーキを緩和し、脚伸展・起き上がり後も台車が慣性で滑走を継続できるようにする
+            float c_glide = Mathf.Lerp(C_rail * 0.35f, C_rail, Mathf.Clamp01(effectiveAngle / (20f * Mathf.Deg2Rad)));
+            float c_effective = Mathf.Lerp(c_glide, c_critical, u_flex * uprightGate);
 
             float halfRail = cfg.W_rail * 0.5f;
             bool wasAtRailLimit = Mathf.Abs(s.x_c) >= (halfRail - 1e-4f);
             float ddx_c_impact = 0f;
 
-            if (effectiveAngle <= deadzoneRad && Mathf.Abs(u_x) < 0.01f && Mathf.Abs(s.x_c) < 0.02f)
+            if (effectiveAngle <= deadzoneRad && Mathf.Abs(u_x) < 0.01f && Mathf.Abs(s.x_c) < 0.02f && Mathf.Abs(s.v_c) < 0.05f)
             {
                 s.v_c_target = 0f;
                 s.v_c_recoil_max = 0f;
                 s.skid_pushback_force = 0f;
-                float ddx_c_stop = -(C_rail / m_c) * s.v_c;
+                float ddx_c_stop = -(c_glide / m_c) * s.v_c;
                 s.v_c += ddx_c_stop * dt;
                 s.x_c += s.v_c * dt;
                 if (Mathf.Abs(s.v_c) < 0.01f) s.v_c = 0f;
@@ -653,13 +721,18 @@ namespace SkyTechSimulator
                     : (s.y_CoM / Mathf.Max(0.18f, s.z_CoM));
 
                 float angleBaseAccel = tanAngleDrive * cfg.g;
-                s.v_c_target = angleBaseAccel * baseGain5Deg * angleShapeFactor;
+                float dirSign = (Mathf.Abs(s.theta1) > 0.001f) ? Mathf.Sign(s.theta1) : Mathf.Sign(s.y_CoM);
+
+                // ロール起き上がり角速度(-omega1)による支点送り出し速度と横方向重心伸展速度を加算
+                bool isRightingMotion = (s.theta1 * s.omega1) < 0f;
+                float rightingFeedVel = isRightingMotion ? (-s.omega1 * s.z_CoM * 0.65f) : 0f;
+                float latStepFeedVel = dirSign * v_y_ext * 0.85f;
+                s.v_c_target = angleBaseAccel * baseGain5Deg * angleShapeFactor + rightingFeedVel + latStepFeedVel;
 
                 float carvingRetention = (s.gripState == SkiGripState.HipCrash || s.gripState == SkiGripState.BootOut)
                     ? 0.0f
                     : Mathf.Lerp(1.0f, cfg.skidGripMultiplier, Mathf.Clamp01(s.skid_intensity));
 
-                // 車止めに引っかかって外向きに押されている状態ではカービング駆動力は発生しない
                 if (wasAtRailLimit && (s.x_c * s.v_c_target > 0f))
                 {
                     carvingRetention = 0f;
@@ -671,14 +744,11 @@ namespace SkyTechSimulator
                 float M_inertia = s.I_eff / R_com_sq;
                 float inertiaMassRatio = M_inertia / (m_c + M_inertia);
 
-                float comHorizExtVel = v_com_ext * Mathf.Sin(absTheta1);
-                s.v_c_recoil_max = inertiaMassRatio * comHorizExtVel;
-
-                float dirSign = (Mathf.Abs(s.theta1) > 0.001f) ? Mathf.Sign(s.theta1) : Mathf.Sign(s.y_CoM);
+                s.v_c_recoil_max = inertiaMassRatio * v_y_ext;
 
                 if (s.gripState == SkiGripState.Skidding && s.P_leg_ext > 1.0f && v_com_ext > 0.001f)
                 {
-                    float dynamicFootForce = (s.P_leg_ext / Mathf.Max(0.3f, v_max_eff)) * Mathf.Sin(absTheta1);
+                    float dynamicFootForce = (s.P_leg_ext / Mathf.Max(0.3f, v_max_eff)) * sinAbsTheta1;
                     s.skid_pushback_force = -dirSign * cfg.carriagePushbackGain * inertiaMassRatio * dynamicFootForce * s.skid_intensity;
                 }
                 else
@@ -693,7 +763,6 @@ namespace SkyTechSimulator
                     float railSign = Mathf.Sign(s.x_c);
                     if (railSign * ddx_c >= 0f)
                     {
-                        // 車止めに押し付けられている間は外向きへの移動を完全に拘束
                         ddx_c = 0f;
                         s.v_c = 0f;
                         s.x_c = railSign * halfRail;
@@ -706,17 +775,8 @@ namespace SkyTechSimulator
                 }
                 else
                 {
+                    // ハード速度クランプ（v_c = -dirSign * v_c_recoil_max）を廃止し、台車の運動量を慣性維持
                     s.v_c += ddx_c * dt;
-
-                    if (Mathf.Abs(dirSign) > 0.001f)
-                    {
-                        float v_opp = -dirSign * s.v_c;
-                        if (v_opp > s.v_c_recoil_max)
-                        {
-                            s.v_c = -dirSign * s.v_c_recoil_max;
-                        }
-                    }
-
                     s.x_c += s.v_c * dt;
                 }
             }
@@ -730,7 +790,7 @@ namespace SkyTechSimulator
                 {
                     float v_c_before = s.v_c;
                     s.v_c = 0f;
-                    float delta_v_c = s.v_c - v_c_before; // -v_c_before
+                    float delta_v_c = s.v_c - v_c_before;
                     ddx_c_impact = delta_v_c / dt;
                 }
             }
@@ -761,7 +821,7 @@ namespace SkyTechSimulator
                 s.gripState = SkiGripState.Skidding;
                 gripFactor = Mathf.Lerp(1.0f, cfg.skidGripMultiplier, Mathf.Clamp01(s.skid_intensity * 1.25f));
             }
-            else if (s.F_leg < N_min && !isRetractingLeg)
+            else if (s.F_vert < N_min && s.F_leg < N_min && !isRetractingLeg)
             {
                 s.gripState = SkiGripState.Unweighted;
                 gripFactor = 0.75f;
@@ -776,7 +836,6 @@ namespace SkyTechSimulator
                 s.gripState == SkiGripState.BootOut ||
                 s.gripState == SkiGripState.HipCrash)
             {
-                // 車止め停止時およびクラッシュ時は仮想遠心力を即座に 0 にする
                 s.a_c = 0f;
                 s.kappa = 0f;
                 s.kappa_target = 0f;
@@ -810,8 +869,7 @@ namespace SkyTechSimulator
                 float tau_gravity = mg * s.y_CoM;
                 float tau_centrifugal = -cfg.M * s.a_c * s.z_CoM_ref;
 
-                // 車止め衝突で台車が急停止した慣性力 (-M * ddx_c_impact * z_CoM) によるつんのめり撃力トルク
-                // Δω_1 = -(M * z_CoM / I_eff) * Δv_c
+                // 車止め衝突で台車が急停止した慣性力によるつんのめり撃力トルク
                 float tau_rail_impact = -cfg.M * ddx_c_impact * s.z_CoM;
 
                 float tau_shift_drive = cfg.comShiftRollDriveGain * mg * s.dy_cmd;
@@ -819,8 +877,9 @@ namespace SkyTechSimulator
 
                 float skidRightingPenalty = 1.0f - 0.85f * Mathf.Clamp01(s.skid_intensity);
                 float activeExtMotionGate = Mathf.Clamp01(v_com_ext / 0.25f);
+                // 横方向の重心移動による横方向踏み込みも起き上がりモーメントに寄与
                 float tau_ext_righting = (s.gripState == SkiGripState.RailLimitHit) ? 0f : -u_norm * activeExtMotionGate * skidRightingPenalty * (
-                    cfg.extRightingTorqueGain * s.u_ext_actual * s.l1 * Mathf.Sin(s.theta1)
+                    cfg.extRightingTorqueGain * (s.u_ext_actual * sinAbsTheta1 + 0.35f * s.F_lat_step) * s.l1 * Mathf.Sign(s.theta1)
                     + cfg.extVelocityRightingGain * mg * v_com_ext * Mathf.Sin(s.theta1)
                 );
 
@@ -828,7 +887,6 @@ namespace SkyTechSimulator
                 float tuckVel = Mathf.Max(0f, -s.dl1);
                 float tau_tuck_centering = -u_flex * uprightFactorForTuck * cfg.tuckRollCenteringGain * cfg.M * (0.35f + tuckVel) * s.theta1;
 
-                // 角度固定サーボ：エッジ支持を失った状態や、設定角度より深く外側へ倒れ込む動きに対しては働かないようにする
                 float tau_lock_servo = 0f;
                 if (s.gripState == SkiGripState.Carving && Mathf.Abs(input.phi_lock_cmd) > 0.001f && shiftActivity < 0.05f)
                 {
@@ -841,7 +899,6 @@ namespace SkyTechSimulator
                     }
                 }
 
-                // ロール減衰：二乗ダンピングを廃止し、支持喪失・倒れ込み時は減衰を最小限にして重力で自然に角加速させる
                 bool isRighting = (s.theta1 * s.omega1) < 0f;
                 float dampingLinear;
                 if (s.gripState == SkiGripState.RailLimitHit ||
@@ -902,6 +959,16 @@ namespace SkyTechSimulator
             }
 
             UpdateKinematics(ref s, cfg);
+
+            // 実重心 y_CoM の横移動速度も次ステップの横方向踏み込み力に反映
+            float v_y_com_actual = (s.y_CoM - prev_y_CoM) / dt;
+            float dirSignPost = (Mathf.Abs(s.theta1) > 0.001f) ? Mathf.Sign(s.theta1) : Mathf.Sign(s.y_CoM);
+            float outwardComVel = Mathf.Max(0f, dirSignPost * v_y_com_actual);
+            if (outwardComVel > 0.01f)
+            {
+                s.F_lat_step += cfg.M * 1.8f * outwardComVel;
+            }
+
             float y_CoM_unshifted = L1 * Mathf.Sin(s.theta1 - delta_theta1_cmd) + L2 * sin2_ref;
             s.dy_actual = s.y_CoM - y_CoM_unshifted;
 
@@ -922,7 +989,7 @@ namespace SkyTechSimulator
             float alphaRad = cfg.alphaDeg * Mathf.Deg2Rad;
             float gravityDrive = cfg.g * Mathf.Sin(alphaRad) * 0.35f;
             float frictionMult = (s.gripState == SkiGripState.Skidding) ? 3.0f : 1.0f;
-            float snowFriction = cfg.mu_snow * frictionMult * (s.F_leg / cfg.M);
+            float snowFriction = cfg.mu_snow * frictionMult * (Mathf.Max(0f, s.F_leg) / cfg.M);
 
             float postureRatio = Mathf.InverseLerp(cfg.l_min, cfg.l_max, s.l1);
             float dragCoeffPerMass = Mathf.Lerp(0.0022f, 0.0036f, postureRatio);

@@ -246,10 +246,15 @@ public class SkyTechGameController : MonoBehaviour
         {
             _input.u_ext_norm = Mathf.MoveTowards(_input.u_ext_norm, 1.0f, 45.0f * Time.deltaTime);
 
-            // 雪面が挫折してスキッディングしているときは足元が押し負けて逃げるため、ロック角の直立戻しを抑える
-            if (!qHeld && !eHeld && _state.gripState != SkiGripState.Skidding && _state.snow_stress_ratio < 0.9f)
+            if (!qHeld && !eHeld && _state.gripState != SkiGripState.Skidding)
             {
-                _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 35.0f * Time.deltaTime);
+                // ロック角の直立戻し速度を引き上げ(35 -> 120 deg/s)、さらに実際のロール角 theta1 が浅くなったらロック角もそこへ追従させる
+                float currentRollDeg = _state.theta1 * Mathf.Rad2Deg;
+                if (Mathf.Abs(currentRollDeg) < Mathf.Abs(_lockedHipDeg))
+                {
+                    _lockedHipDeg = currentRollDeg;
+                }
+                _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 120.0f * Time.deltaTime);
             }
         }
         else
