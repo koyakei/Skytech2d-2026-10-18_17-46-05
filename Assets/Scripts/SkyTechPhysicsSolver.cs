@@ -237,18 +237,19 @@ namespace SkyTechSimulator
             float theta_res0 = Mathf.Atan(G0_approx);
             float g_eff0 = cfg.g * Mathf.Sqrt(1.0f + G0_approx * G0_approx);
 
-            float etaVertBudget = (1.0f - Mathf.Clamp(cfg.shiftPriorityReserveRatio, 0.65f, 0.95f)) * (1.0f - forceOverride);
-            float alphaVert = Mathf.Clamp01(cfg.refVerticalKeepRatio) * (1.0f - forceOverride);
+            float etaVertBudget = (1.0f - Mathf.Clamp(cfg.shiftPriorityReserveRatio, 0.65f, 0.95f)) * (1.0f - 0.5f * forceOverride);
+            float alphaVert = Mathf.Clamp01(cfg.refVerticalKeepRatio);
             float deltaVertMax = Mathf.Asin(Mathf.Clamp((etaVertBudget * tauHipMax) / Mathf.Max(1.0f, m2_l2 * g_eff0), 0f, 1.0f));
 
             float theta2_des = theta_res0 - Mathf.Clamp(alphaVert * theta_res0, -deltaVertMax, deltaVertMax);
-            float phiRefLimit = etaVertBudget * phiMax;
+            float phiRefLimit = Mathf.Max(0.25f * phiMax, etaVertBudget * phiMax);
             s.theta2_ref = Mathf.Clamp(theta2_des, s.theta1 - phiRefLimit, s.theta1 + phiRefLimit);
             float phi_ref = s.theta1 - s.theta2_ref;
 
             s.y_CoM_ref = L1 * sin1 + L2 * Mathf.Sin(s.theta2_ref);
             s.z_CoM_ref = Mathf.Max(0.18f, L1 * cos1 + L2 * Mathf.Cos(s.theta2_ref));
-            float G_eq = s.y_CoM_ref / s.z_CoM_ref;
+            // 外向傾で腰を出した際に過大な仮想遠心力で右へ押し戻されないよう、実重心位置 s.y_CoM を反映
+            float G_eq = Mathf.Lerp(s.y_CoM_ref / s.z_CoM_ref, s.y_CoM / Mathf.Max(0.18f, s.z_CoM), 0.75f);
 
             // 股関節の筋長-張力ガウス特性と目標角
             float u_stroke_mag = Mathf.Clamp01(Mathf.Abs(s.phi) / phiMax);
@@ -276,12 +277,15 @@ namespace SkyTechSimulator
 
             float delta_theta1_cmd = Mathf.Asin(Mathf.Clamp(sin1 + s.dy_cmd / L_eff, -0.99f, 0.99f)) - s.theta1;
 
-            // クロスオーバー時の体幹ダイブ角（分岐なしの連続式）
-            float crossOverBoost = 1.0f + 0.60f * Mathf.Clamp01((-s.theta1 * s.u_shift_filtered) / (15.0f * Mathf.Deg2Rad));
-            float extIntent = Mathf.Clamp01(Mathf.Max(input.u_ext_norm, s.dl1 / 0.35f));
-            float headDiveRad = s.u_shift_filtered * (cfg.extHeadDiveMaxDeg * Mathf.Deg2Rad) * (0.70f + 0.30f * extIntent * crossOverBoost);
+            // 姿勢が低いほど「腰を横に出して上体を残す（外向傾）」比率を高め、ヘッドダイブを抑制する
+            float lowPostureFactor = 1.0f - s.s_rom; // 低い姿勢ほど 1.0 に近づく
+            float crossOverGate = Mathf.Clamp01((-s.theta1 * s.u_shift_filtered) / (15.0f * Mathf.Deg2Rad));
+            float extIntent = Mathf.Clamp01(Mathf.Max(input.u_ext_norm, s.dl1 / 0.35f)) * s.s_rom;
+            // 常時70%のヘッドダイブを廃止し、高姿勢での強い伸展クロスオーバー時のみ発生させる
+            float headDiveRad = s.u_shift_filtered * (cfg.extHeadDiveMaxDeg * Mathf.Deg2Rad) * (0.25f * extIntent * crossOverGate);
 
-            float effectiveAngRatio = angulationRatio * (1.0f - forceOverride);
+            // マウス横移動時かつ低姿勢時は、頭ではなく腰が先に出るよう外向傾（phiと同符号）をしっかり効かせる
+            float effectiveAngRatio = Mathf.Clamp(angulationRatio + 0.35f * lowPostureFactor, 0.35f, 0.90f);
             float minPhiLimit = Mathf.Min(-phiMax, cfg.phi_in_maxRad * 1.35f);
             float maxPhiLimit = Mathf.Max( phiMax, -cfg.phi_in_maxRad * 1.35f);
             float phi_target = Mathf.Clamp(effectiveAngRatio * (s.theta1 + delta_theta1_cmd) - headDiveRad, minPhiLimit, maxPhiLimit);
@@ -346,11 +350,17 @@ namespace SkyTechSimulator
             float activeInputMag = Mathf.Clamp01(u_norm + u_flex);
             float dampingMult = Mathf.Lerp(1.05f, 0.40f, activeInputMag);
 
-            float selfWeightSupport = mg * phi_support * (1.0f - 0.85f * u_flex);
-            float activeTuckPull = u_flex * (0.95f + cfg.releaseTuckPullG) * mg;
+            // 目標高より高い位置から縮んでいる最中のみ抜重(tuck)を効かせ、低姿勢保持・横プッシュ時は踏力を残す
+            float flexUnweightGate = (hasTargetGate > 0.5f)
+                ? Mathf.Clamp01((s.l1 - l_hold) / 0.04f) * (1.0f - 0.65f * shiftActivity)
+                : (1.0f - 0.55f * shiftActivity);
+            float u_flex_eff = u_flex * flexUnweightGate;
+
+            float selfWeightSupport = mg * phi_support * (1.0f - 0.85f * u_flex_eff);
+            float activeTuckPull = u_flex_eff * (0.95f + cfg.releaseTuckPullG) * mg;
 
             float passiveForce = selfWeightSupport
-                               + stanceSpringForce * (1.0f - u_flex)
+                               + stanceSpringForce * (1.0f - u_flex_eff)
                                - activeTuckPull
                                - dampingMult * c_ecc * s.dl1;
 
@@ -386,7 +396,7 @@ namespace SkyTechSimulator
 
             float xi_ext = 1.0f - phi_support;
             float baseSupportCoeff = Mathf.Lerp(phi_support, 1.0f, Mathf.Clamp01(u_norm + hasTargetGate));
-            float vertSupportG = (baseSupportCoeff - xi_ext * s.G_z_up) * (1.0f - 0.85f * u_flex);
+            float vertSupportG = (baseSupportCoeff - xi_ext * s.G_z_up) * (1.0f - 0.85f * u_flex_eff);
 
             s.F_vert = mg * vertSupportG + stanceReturnForce - activeTuckPull
                      - dampingMult * c_ecc * s.dl1 * cosAbsTheta1 + s.u_ext_actual * cosAbsTheta1;
@@ -455,13 +465,18 @@ namespace SkyTechSimulator
             float dynamicFootForce = (s.P_leg_ext / Mathf.Max(0.3f, v_max_eff)) * sinAbsTheta1;
             s.skid_pushback_force = -dirSign * cfg.carriagePushbackGain * inertiaMassRatio * dynamicFootForce * s.skid_intensity;
 
+            // 姿勢を低くして重心シフトする際、脚が台車を逆方向（左シフトなら右方向 +x）へ押す水平反力
+            float lowPushLeverage = 1.0f + 0.65f * (1.0f - s.s_rom);
+            float legPushForce = -s.u_shift_filtered * (0.35f * s.F_leg) * lowPushLeverage * inertiaMassRatio;
+            // 台車が向かってくる（重心シフトと逆向きに動いている、または追いかけてくる）際の脚の踏ん張り抵抗
+            float oncomingResist = (s.v_c * s.u_shift_filtered > 0f) ? (-c_glide * 0.45f * s.v_c * shiftActivity) : 0f;
+
             float halfRail = cfg.W_rail * 0.5f;
+            float x_c_prev = s.x_c;
             float v_c_prev = s.v_c;
-            float v_c_free = v_c_prev + ((F_drive + s.skid_pushback_force - c_glide * v_c_prev) / m_c) * dt;
-            s.x_c = Mathf.Clamp(s.x_c + v_c_free * dt, -halfRail, halfRail);
-            s.v_c = (s.x_c - (s.x_c - v_c_free * dt)) / dt; // クランプ後の実移動速度
-            // ※厳密な位置差分速度:
-            // (上で x_c_prev を保持して計算)
+            float v_c_free = v_c_prev + ((F_drive + s.skid_pushback_force + legPushForce + oncomingResist - c_glide * v_c_prev) / m_c) * dt;
+            s.x_c = Mathf.Clamp(x_c_prev + v_c_free * dt, -halfRail, halfRail);
+            s.v_c = (s.x_c - x_c_prev) / dt;
             float ddx_c = (s.v_c - v_c_prev) / dt;
 
             float v_req = Mathf.Abs(s.v_c_target);
@@ -495,17 +510,29 @@ namespace SkyTechSimulator
             {
                 float tau_gravity = mg * s.y_CoM;
                 float tau_carriage_com = -cfg.M * (0.35f * ddx_c + s.a_c) * s.z_CoM;
-                float tau_leg_com_offset = eta_carriage * s.F_leg * (s.y_CoM * cos1 - s.z_CoM * sin1);
+
+                // 外向傾(phi)を作った際に腰を逆方向へ押し戻してしまう成分を除去し、純粋な脚の横押し駆動トルクにする
+                float lowStanceBoost = 1.0f + 0.75f * (1.0f - s.s_rom);
+                float legSupportRatio = Mathf.Clamp(s.F_leg / mg, 0.35f, 1.8f);
+                float kp_leg_roll = cfg.comShiftRollDriveGain * cfg.mouseRollMomentGain * mg * s.l1 * lowStanceBoost * legSupportRatio;
+                float kd_leg_roll = 0.18f * kp_leg_roll;
+                float tau_leg_lateral_drive = kp_leg_roll * delta_theta1_cmd - kd_leg_roll * s.omega1;
+
+                // 台車が進んでくる方向と逆に脚で踏ん張ることで、重心を台車の向こう側（左）へ送り出すトルク
+                float oncomingPushTorque = s.u_shift_filtered * Mathf.Abs(s.v_c) * (0.45f * mg * s.z_CoM) * lowStanceBoost;
 
                 float skidRightingPenalty = 1.0f - 0.40f * s.skid_intensity;
                 float activeExtMotionGate = Mathf.Clamp01(Mathf.Max(v_com_ext / 0.20f, (s.u_ext_actual / (1.2f * mg)) * 0.85f));
-                float tau_leg_carriage_push = -eta_carriage * activeExtMotionGate * skidRightingPenalty
+                // マウスで同方向へ倒し込んでいる最中は、伸展による直立戻しトルク(tau_leg_carriage_push)を抑制
+                float rightingSuppress = 1.0f - 0.80f * Mathf.Clamp01(s.u_shift_filtered * Mathf.Sign(s.theta1));
+                float tau_leg_carriage_push = -eta_carriage * activeExtMotionGate * skidRightingPenalty * rightingSuppress
                     * (cfg.extRightingTorqueGain * s.u_ext_actual * s.l1 + cfg.extVelocityRightingGain * mg * v_com_ext) * sin1;
 
-                float tau_hip_carriage = eta_carriage * cfg.hipReactionGain * s.tau_hip_steer;
+                // 股関節トルクによる脚リンクへの結合：外向傾(phi < 0)で腰が左(theta1 < 0)へ出るよう符号を一致させる
+                float tau_hip_carriage = -eta_carriage * (0.25f * cfg.hipReactionGain) * s.tau_hip_steer;
                 float tau_damping = -Mathf.Min(cfg.gamma_roll, 10.0f) * s.omega1;
 
-                float domega1 = (tau_gravity + tau_carriage_com + tau_leg_com_offset
+                float domega1 = (tau_gravity + tau_carriage_com + tau_leg_lateral_drive + oncomingPushTorque
                                + tau_leg_carriage_push + tau_hip_carriage + tau_damping) / s.I_eff;
 
                 float theta1_prev = s.theta1;

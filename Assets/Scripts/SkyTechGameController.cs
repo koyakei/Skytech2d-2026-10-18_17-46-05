@@ -331,9 +331,10 @@ public class SkyTechGameController : MonoBehaviour
             float linDrive = Mathf.Clamp(dampedError / 0.12f, -1.0f, 1.0f);
             float smoothDrive = linDrive * Mathf.Abs(linDrive);
 
-            // 上端(l_max)・下端(l_min)付近へ大きく動かしたときのみフル出力へ滑らかにブースト
+            // 上端(l_max)へ動かしたとき、または下端(l_min)へ向かって実際に脚を縮めている最中のみブースト
             float topBoost    = Mathf.SmoothStep(0f, 1f, (targetL1 - (Config.l_max - 0.03f)) / 0.025f);
-            float bottomBoost = Mathf.SmoothStep(0f, 1f, ((Config.l_min + 0.03f) - targetL1) / 0.025f);
+            float bottomBoost = Mathf.SmoothStep(0f, 1f, ((Config.l_min + 0.03f) - targetL1) / 0.025f)
+                              * Mathf.Clamp01((_state.l1 - targetL1) / 0.03f);
 
             float extTarget  = Mathf.Max(Mathf.Max(0f, smoothDrive), topBoost);
             float flexTarget = Mathf.Max(Mathf.Max(0f, -smoothDrive), bottomBoost);
