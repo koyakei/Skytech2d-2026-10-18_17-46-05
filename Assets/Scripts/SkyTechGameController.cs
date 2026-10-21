@@ -6,6 +6,18 @@ using UnityEngine.InputSystem;
 
 public class SkyTechGameController : MonoBehaviour
 {
+    public enum MouseHeightControlMode
+    {
+        [Tooltip("画面の上下中央を基準高さ(標準スタンス)とし、上へ動かすと伸長(l_max)、下へ動かすと短縮(l_min)")]
+        VerticalSignedFromCenter,
+
+        [Tooltip("画面の中心座標(X, Y)からの2D距離で制御（中心に近いほど伸長 l_max、離れるほど短縮 l_min）")]
+        DistanceFromScreenCenter,
+
+        [Tooltip("画面の上下中央(Y)からの垂直距離 |dy| で制御（中央の高さに近いほど伸長 l_max、上下に離れるほど短縮 l_min）")]
+        VerticalDistanceFromCenter
+    }
+
     [Header("=== 設定アセット ===")]
     public SkyTechSimConfig Config;
 
@@ -13,13 +25,22 @@ public class SkyTechGameController : MonoBehaviour
     public bool AutoAngulationAssist = false;
     public bool UseMouseControl = true;
 
-    [Tooltip("マウスがこの距離(m)以下に台車へ近づくと脚を最大長(l_max)まで伸長")]
+    [Tooltip("画面中央基準での高さ（脚の伸縮）制御モード")]
+    public MouseHeightControlMode HeightControlMode = MouseHeightControlMode.VerticalSignedFromCenter;
+
+    [Tooltip("[VerticalSignedFromCenter用] 画面中央から上方向へこの距離(m)動かすと最大伸長(l_max)")]
+    public float MouseExtendUpRange = 0.55f;
+
+    [Tooltip("[VerticalSignedFromCenter用] 画面中央から下方向へこの距離(m)動かすと最小屈曲(l_min)")]
+    public float MouseFlexDownRange = 0.85f;
+
+    [Tooltip("[Distance系モード用] 画面中央からこの距離(m)以下に近づくと脚を最大長(l_max)まで伸長")]
     public float MouseFullExtendDist = 0.40f;
 
-    [Tooltip("マウスがこの距離(m)以上に台車から離れると脚を最小長(l_min)まで短縮")]
+    [Tooltip("[Distance系モード用] 画面中央からこの距離(m)以上に離れると脚を最小長(l_min)まで短縮")]
     public float MouseFullFlexDist = 1.45f;
 
-    [Tooltip("脚の延長線上での左右チャタリング防止用微小デッドゾーン(m)")]
+    [Tooltip("画面の左右中央線上でのチャタリング防止用微小デッドゾーン(m)")]
     public float MouseLineDeadzone = 0.005f;
 
     public SimState CurrentState => _state;
@@ -254,9 +275,10 @@ public class SkyTechGameController : MonoBehaviour
 #endif
 
         Vector2 mouseWorld = Vector2.zero;
-        bool hasMouseWorld = UseMouseControl && TryGetMouseWorldPosition(out mouseWorld);
+        Vector2 screenCenterWorld = Vector2.zero;
+        bool hasMouseWorld = UseMouseControl && TryGetMouseWorldPosition(out mouseWorld, out screenCenterWorld);
 
-        // --- 1. 脚の伸縮入力（キーボード優先、未押下時はマウスと台車の距離で制御） ---
+        // --- 1. 脚の伸縮入力（キーボード優先、未押下時は画面中央基準で高さを制御） ---
         if (extPressed || flexPressed)
         {
             _input.l1_target = 0f;
@@ -286,15 +308,57 @@ public class SkyTechGameController : MonoBehaviour
         }
         else if (hasMouseWorld && Config != null)
         {
-            // 台車位置 P = (x_c, 0) とマウスワールド座標との距離
-            Vector2 carriagePos = new Vector2(_state.x_c, 0f);
-            float distToCarriage = Vector2.Distance(mouseWorld, carriagePos);
+            float targetL1;
 
-            // 台車に近づけるほど l_max (伸長)、遠くするほど l_min (短縮)
-            float nearDist = Mathf.Max(0.05f, MouseFullExtendDist);
-            float farDist = Mathf.Max(nearDist + 0.10f, MouseFullFlexDist);
-            float tDist = Mathf.InverseLerp(nearDist, farDist, distToCarriage);
-            float targetL1 = Mathf.Lerp(Config.l_max, Config.l_min, tDist);
+            switch (HeightControlMode)
+            {
+                case MouseHeightControlMode.VerticalSignedFromCenter:
+                {
+                    // 画面の上下中央 (screenCenterWorld.y) を基準高さ (l_hold) とし、
+                    // 上方向で l_max (伸長)、下方向で l_min (短縮)
+                    float dy = mouseWorld.y - screenCenterWorld.y;
+                    float drop = Config.supportDropFromMaxMeters;
+                    float neutralL1 = Mathf.Clamp(Config.l_max - drop, Config.l_min, Config.l_max);
+
+                    if (dy >= 0f)
+                    {
+                        float upRange = Mathf.Max(0.05f, MouseExtendUpRange);
+                        float tUp = Mathf.Clamp01(dy / upRange);
+                        targetL1 = Mathf.Lerp(neutralL1, Config.l_max, tUp);
+                    }
+                    else
+                    {
+                        float downRange = Mathf.Max(0.05f, MouseFlexDownRange);
+                        float tDown = Mathf.Clamp01((-dy) / downRange);
+                        targetL1 = Mathf.Lerp(neutralL1, Config.l_min, tDown);
+                    }
+                    break;
+                }
+
+                case MouseHeightControlMode.VerticalDistanceFromCenter:
+                {
+                    // 画面の上下中央 (screenCenterWorld.y) からの垂直距離 |dy| で制御
+                    float vertDist = Mathf.Abs(mouseWorld.y - screenCenterWorld.y);
+                    float nearDist = Mathf.Max(0.02f, MouseFullExtendDist);
+                    float farDist = Mathf.Max(nearDist + 0.10f, MouseFullFlexDist);
+                    float tDist = Mathf.InverseLerp(nearDist, farDist, vertDist);
+                    targetL1 = Mathf.Lerp(Config.l_max, Config.l_min, tDist);
+                    break;
+                }
+
+                case MouseHeightControlMode.DistanceFromScreenCenter:
+                default:
+                {
+                    // 画面の中心座標 (screenCenterWorld.x, screenCenterWorld.y) からの距離で制御
+                    float distToCenter = Vector2.Distance(mouseWorld, screenCenterWorld);
+                    float nearDist = Mathf.Max(0.05f, MouseFullExtendDist);
+                    float farDist = Mathf.Max(nearDist + 0.10f, MouseFullFlexDist);
+                    float tDist = Mathf.InverseLerp(nearDist, farDist, distToCenter);
+                    targetL1 = Mathf.Lerp(Config.l_max, Config.l_min, tDist);
+                    break;
+                }
+            }
+
             _input.l1_target = targetL1;
 
             float lengthError = targetL1 - _state.l1;
@@ -336,7 +400,7 @@ public class SkyTechGameController : MonoBehaviour
             _input.u_flex_norm = 0f;
         }
 
-        // --- 2. 左右ステアリング入力（現在の脚の延長線の右側なら右矢印キー、左側なら左矢印キーと同じ動作） ---
+        // --- 2. 左右ステアリング入力（マウス横移動距離に応じたアナログ比例制御） ---
         float steer = 0f;
         bool kbLeft = IsKeyHeld(KeyCode.A, KeyCodeToKey(KeyCode.A)) || IsKeyHeld(KeyCode.LeftArrow, KeyCodeToKey(KeyCode.LeftArrow));
         bool kbRight = IsKeyHeld(KeyCode.D, KeyCodeToKey(KeyCode.D)) || IsKeyHeld(KeyCode.RightArrow, KeyCodeToKey(KeyCode.RightArrow));
@@ -348,22 +412,15 @@ public class SkyTechGameController : MonoBehaviour
         }
         else if (hasMouseWorld)
         {
-            // 台車位置 P(x_c, 0) を通り、現在の脚方向 (sin(theta1), cos(theta1)) に伸びる直線に対する符号付き垂直距離
-            // d_right > 0: 脚の延長線の右側 -> 右矢印キー (steer = +1f)
-            // d_right < 0: 脚の延長線の左側 -> 左矢印キー (steer = -1f)
-            float dx = mouseWorld.x - _state.x_c;
-            float dy = mouseWorld.y;
-            float sin1 = Mathf.Sin(_state.theta1);
-            float cos1 = Mathf.Cos(_state.theta1);
-            float signedRightDist = dx * cos1 - dy * sin1;
+            float dx = mouseWorld.x - screenCenterWorld.x;
+            float absDx = Mathf.Abs(dx);
 
-            if (signedRightDist > MouseLineDeadzone)
+            if (absDx > MouseLineDeadzone)
             {
-                steer = 1f;
-            }
-            else if (signedRightDist < -MouseLineDeadzone)
-            {
-                steer = -1f;
+                float fullRange = (Config != null) ? Mathf.Max(0.15f, Config.mouseSteerFullRange) : 1.15f;
+                float normSteer = Mathf.Clamp01((absDx - MouseLineDeadzone) / fullRange);
+                // 少しの動きではマイルドに、大きく動かしたときに強く効くカーブ
+                steer = Mathf.Sign(dx) * Mathf.Lerp(normSteer, normSteer * normSteer, 0.35f);
             }
         }
 
@@ -389,20 +446,17 @@ public class SkyTechGameController : MonoBehaviour
         _input.steer_neutral_cmd = _isSteerNeutralActive;
     }
 
-    private static bool TryGetMouseWorldPosition(out Vector2 worldPos)
+    private static bool TryGetMouseWorldPosition(out Vector2 worldPos, out Vector2 screenCenterWorld)
     {
         worldPos = Vector2.zero;
+        screenCenterWorld = Vector2.zero;
+
         Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
         if (cam == null) return false;
 
         Vector3 screenPos = Vector3.zero;
         bool hasPos = false;
 
-        // 1. レガシー Input.mousePosition を優先的に試行
-        // macOS (Retina/High-DPI) 環境では、Unity 内部で Game View の物理ピクセル解像度 (cam.pixelRect) に
-        // 自動補正されるため、ScreenToWorldPoint との整合性が最も高くなります。
-        // ※ MacBook 内蔵トラックパッドでは Input.mousePresent が false を返す仕様があるため、
-        //    mousePresent による除外は行わず直接取得を試みます。
         try
         {
             Vector3 legacyPos = Input.mousePosition;
@@ -414,15 +468,12 @@ public class SkyTechGameController : MonoBehaviour
         }
         catch
         {
-            // Input System 専用モード等で例外が発生した場合はフォールバック
             hasPos = false;
         }
 
 #if ENABLE_INPUT_SYSTEM
-        // 2. New Input System からの取得（Input.mousePosition が無効な場合）
         if (!hasPos)
         {
-            // マウスだけでなくトラックパッドやペンなどの各種ポインターデバイスに対応
             var pointer = (Pointer.current != null) ? Pointer.current : (Pointer)Mouse.current;
             if (pointer != null)
             {
@@ -432,10 +483,6 @@ public class SkyTechGameController : MonoBehaviour
                     screenPos = new Vector3(mp.x, mp.y, 0f);
                     hasPos = true;
 
-                    // macOS (Retina) 環境のスケーリング補正:
-                    // pointer.position は論理ポイント単位 (Points) を返す場合があり、
-                    // cam.ScreenToWorldPoint は物理ピクセル (cam.pixelWidth) を想定しているため、
-                    // スケール比率（通常 2.0x）を検知して適切に物理ピクセルへスケーリングします。
 #if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
                     float retinaFactor = 1.0f;
 #if UNITY_EDITOR
@@ -452,7 +499,6 @@ public class SkyTechGameController : MonoBehaviour
 #endif
                     if (retinaFactor > 1.05f)
                     {
-                        // 既に物理ピクセル単位になっている場合（2重適用）を防止
                         if (screenPos.x * retinaFactor <= cam.pixelWidth * 1.05f &&
                             screenPos.y * retinaFactor <= cam.pixelHeight * 1.05f)
                         {
@@ -468,9 +514,15 @@ public class SkyTechGameController : MonoBehaviour
 
         if (!hasPos) return false;
 
-        screenPos.z = -cam.transform.position.z;
+        float depth = -cam.transform.position.z;
+        screenPos.z = depth;
         Vector3 wp = cam.ScreenToWorldPoint(screenPos);
         worldPos = new Vector2(wp.x, wp.y);
+
+        Vector3 centerScreen = new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, depth);
+        Vector3 cp = cam.ScreenToWorldPoint(centerScreen);
+        screenCenterWorld = new Vector2(cp.x, cp.y);
+
         return true;
     }
 

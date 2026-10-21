@@ -304,9 +304,25 @@ namespace SkyTechSimulator
             float theta_res0 = Mathf.Atan(G0_approx);
             float g_eff0 = cfg.g * Mathf.Sqrt(1.0f + G0_approx * G0_approx);
 
+            float u_x = (input.w_reset || input.steer_neutral_cmd) ? 0f : Mathf.Clamp(-input.phi_steer_cmd, -1.0f, 1.0f);
+            float tauShift = Mathf.Max(0.01f, cfg.comShiftResponseTau);
+            if (input.w_reset)
+            {
+                s.u_shift_filtered = 0f;
+            }
+            else
+            {
+                s.u_shift_filtered += ((u_x - s.u_shift_filtered) / tauShift) * dt;
+            }
+
+            float shiftActivity = Mathf.Clamp01(Mathf.Max(Mathf.Abs(u_x), Mathf.Abs(s.u_shift_filtered)));
+
+            // マウス入力がある時は、合力の延長線上に留まろうとする基準姿勢の拘束を解除する
+            float forceOverride = cfg.mouseForceOverrideRatio * shiftActivity;
+
             float etaShiftReserve = Mathf.Clamp(cfg.shiftPriorityReserveRatio, 0.65f, 0.95f);
-            float etaVertBudget = 1.0f - etaShiftReserve;
-            float alphaVert = Mathf.Clamp01(cfg.refVerticalKeepRatio);
+            float etaVertBudget = (1.0f - etaShiftReserve) * (1.0f - forceOverride);
+            float alphaVert = Mathf.Clamp01(cfg.refVerticalKeepRatio) * (1.0f - forceOverride);
 
             float sinDeltaVert = Mathf.Clamp((etaVertBudget * tauHipMax) / Mathf.Max(1.0f, m2_l2 * g_eff0), 0f, 1.0f);
             float deltaVertMax = Mathf.Asin(sinDeltaVert);
@@ -325,7 +341,7 @@ namespace SkyTechSimulator
             float G_eq = s.y_CoM_ref / s.z_CoM_ref;
 
             // =========================================================================
-            // 2. 同位相重心移動モデル
+            // 2. ローリングモーメント優先・ヘッドダイブ重心移動モデル
             // =========================================================================
             float g_eff = Mathf.Sqrt(cfg.g * cfg.g + s.a_c * s.a_c);
 
@@ -338,7 +354,9 @@ namespace SkyTechSimulator
             float gaussianFactor = Mathf.Exp(-(normStrain * normStrain));
             float tau_hip_avail = tauHipMax * gaussianFactor;
 
-            float sinDeltaTorque = Mathf.Clamp(tau_hip_avail / Mathf.Max(1.0f, m2_l2 * g_eff), 0f, 1.0f);
+            // 合力によるトルク上限でマウス指令が頭打ちにならないよう、マウス操作時は実効重力負荷の影響を緩和
+            float g_eff_for_limit = Mathf.Lerp(g_eff, cfg.g * 0.65f, forceOverride);
+            float sinDeltaTorque = Mathf.Clamp(tau_hip_avail / Mathf.Max(1.0f, m2_l2 * g_eff_for_limit), 0f, 1.0f);
             float deltaThetaTorque = Mathf.Asin(sinDeltaTorque);
 
             float kappaTrunk = Mathf.Clamp(cfg.trunkInPhaseRatio, 0.25f, 0.85f);
@@ -353,44 +371,59 @@ namespace SkyTechSimulator
             s.dy_min_torque = L_eff * (Mathf.Sin(theta1_shift_min) - sin1);
             s.dy_max_torque = L_eff * (Mathf.Sin(theta1_shift_max) - sin1);
 
-            float u_x = (input.w_reset || input.steer_neutral_cmd) ? 0f : Mathf.Clamp(-input.phi_steer_cmd, -1.0f, 1.0f);
-
-            float tauShift = Mathf.Max(0.01f, cfg.comShiftResponseTau);
-            if (input.w_reset)
-            {
-                s.u_shift_filtered = 0f;
-            }
-            else
-            {
-                s.u_shift_filtered += ((u_x - s.u_shift_filtered) / tauShift) * dt;
-            }
-
-            float maxShiftDesign = Mathf.Max(0.05f, cfg.comShiftMaxMeters);
+            float maxShiftDesign = Mathf.Max(0.05f, cfg.comShiftMaxMeters) * (1.0f + 0.65f * forceOverride);
             float dy_desired = s.u_shift_filtered * maxShiftDesign;
-            s.dy_cmd = Mathf.Clamp(dy_desired, s.dy_min_torque, s.dy_max_torque);
+            // 合力トルク制限よりもマウス指令のシフト量を優先する
+            s.dy_cmd = Mathf.Lerp(
+                Mathf.Clamp(dy_desired, s.dy_min_torque, s.dy_max_torque),
+                dy_desired,
+                forceOverride
+            );
 
             float delta_s1_cmd = s.dy_cmd / L_eff;
             float s1_target = Mathf.Clamp(sin1 + delta_s1_cmd, -0.99f, 0.99f);
             float theta1_shift_target = Mathf.Asin(s1_target);
             float delta_theta1_cmd = theta1_shift_target - s.theta1;
 
-            float phi_base_ang = angulationRatio * s.theta1;
-            float delta_phi_cmd = angulationRatio * delta_theta1_cmd;
-            float phi_target = Mathf.Clamp(phi_base_ang + delta_phi_cmd, -phiMax, +phiMax);
+            // --- 倒れた状態からの「脚伸展 ＋ 脚側(クロスオーバー方向)への大きなマウス移動」判定 ---
+            // s.theta1 < 0 (画面上で右傾き/右ターン中) のとき、脚側(台車・ブーツ側)は左(画面左側: dx < 0 -> u_x < 0 ではなく、
+            // 座標系では y_CoM = l1 * sin(theta1) なので、theta1 > 0 なら重心が右(+x)、脚(ブーツP)は重心から見て左(-x)側にある。
+            // 倒れた状態(theta1 != 0)から脚側(ブーツ側 = -Sign(theta1) 方向)へマウスを大きく動かしたとき、
+            // すなわち (s.theta1 * s.u_shift_filtered) < 0f のときが「脚側(谷側/次のターン内側)へのクロスオーバー移動」となる。
+            // ※もし「傾いている方向と同じ側(+Sign(theta1))」へも頭を突っ込ませたい場合は、方向を問わずマウス入力方向へダイブさせる。
+            float leanFactor = Mathf.Clamp01(Mathf.Abs(s.theta1) / (15.0f * Mathf.Deg2Rad));
+            float extIntent = Mathf.Clamp01(Mathf.Max(input.u_ext_norm, s.dl1 / 0.35f));
+            float crossOverFactor = (s.theta1 * s.u_shift_filtered < 0f) ? (1.0f + 0.55f * leanFactor) : 1.0f;
+            float headDiveFactor = extIntent * Mathf.Abs(s.u_shift_filtered) * crossOverFactor;
+
+            // マウス操作時は合力の延長線（外向傾ベース phi_base_ang）を解除し、頭をマウス方向へ直接突っ込ませる
+            float effectiveAngRatio = angulationRatio * (1.0f - forceOverride);
+            float phi_base_ang = effectiveAngRatio * s.theta1;
+
+            // 通常のシフトによる股関節角変化 + 脚伸展＆横マウス移動によるヘッドダイブ角
+            float headDiveRad = s.u_shift_filtered * (cfg.extHeadDiveMaxDeg * Mathf.Deg2Rad) * (0.35f + 0.65f * extIntent * crossOverFactor);
+            float delta_phi_cmd = angulationRatio * delta_theta1_cmd - headDiveRad;
+
+            // 内倒側の上限(phi_in_maxRad)と外向傾上限(phiMax)の非対称クランプを許容し、頭が脚を追い越して突っ込めるようにする
+            float minPhiLimit = Mathf.Min(-phiMax, cfg.phi_in_maxRad * 1.35f);
+            float maxPhiLimit = Mathf.Max(phiMax, -cfg.phi_in_maxRad * 1.35f);
+            float phi_target = Mathf.Clamp(phi_base_ang + delta_phi_cmd, minPhiLimit, maxPhiLimit);
             float theta2_target = s.theta1 - phi_target;
 
-            float shiftActivity = Mathf.Clamp01(Mathf.Abs(u_x) + Mathf.Abs(s.u_shift_filtered));
             float theta2_cur = s.theta1 - s.phi;
 
+            // 遠心力との釣り合いフィードフォワード(tau_hip_ff内のa_c項)をマウス操作時は抑制し、鉛直〜マウス方向への倒し込みを優先
+            float a_c_ff = s.a_c * (1.0f - 0.85f * forceOverride);
             float tau_hip_load = m2_l2 * (cfg.g * Mathf.Sin(theta2_cur) - s.a_c * Mathf.Cos(theta2_cur));
-            float tau_hip_ff   = m2_l2 * (cfg.g * Mathf.Sin(theta2_target) - s.a_c * Mathf.Cos(theta2_target));
+            float tau_hip_ff   = m2_l2 * (cfg.g * Mathf.Sin(theta2_target) - a_c_ff * Mathf.Cos(theta2_target));
 
             float kp_base = Mathf.Max(600.0f, cfg.kp_hip * 1.4f);
-            float kp_shift_boost = kp_base * (1.0f + 0.85f * shiftActivity);
-            float kd_ctrl = Mathf.Max(45.0f, cfg.kd_hip * 1.3f);
+            float kp_shift_boost = kp_base * (1.0f + 1.35f * shiftActivity + 0.85f * headDiveFactor);
+            float kd_ctrl = Mathf.Max(45.0f, cfg.kd_hip * 1.2f);
 
             float tau_hip_pd = kp_shift_boost * (phi_target - s.phi) - kd_ctrl * s.dphi;
-            s.tau_hip_steer = Mathf.Clamp(tau_hip_ff + tau_hip_pd, -tau_hip_avail, +tau_hip_avail);
+            float maxHipTorque = tau_hip_avail * (1.0f + 0.50f * headDiveFactor);
+            s.tau_hip_steer = Mathf.Clamp(tau_hip_ff + tau_hip_pd, -maxHipTorque, +maxHipTorque);
 
             // =========================================================================
             // 3. 下肢アクチュエーター（伸展: Space/↑/マウス接近, 抱え込み: ↓/S/マウス離間）
@@ -714,24 +747,29 @@ namespace SkyTechSimulator
             }
             else
             {
-                const float midBankScale = 0.35f;
-                const float deepBankBoost = 2.20f;
+                const float midBankScale = 0.40f;
+                const float deepBankBoost = 0.35f; // 2.20f から大幅に引き下げ、高バンクでの暴走を防止
                 const float baseGain5Deg = 1.217f;
 
                 float sinRoll = Mathf.Sin(effectiveAngle);
                 float angleShapeFactor = Mathf.Lerp(1.0f, midBankScale, Mathf.Clamp01((effectiveAngle - 5f * Mathf.Deg2Rad) / (25f * Mathf.Deg2Rad)))
-                                       + deepBankBoost * (sinRoll * sinRoll * sinRoll);
+                                       + deepBankBoost * (sinRoll * sinRoll);
 
-                float tanAngleDrive = (Mathf.Abs(s.theta1) >= Mathf.Abs(s.Psi_CoM))
+                float rawTanDrive = (Mathf.Abs(s.theta1) >= Mathf.Abs(s.Psi_CoM))
                     ? G_steady
                     : (s.y_CoM / Mathf.Max(0.18f, s.z_CoM));
+
+                // 実際のスキーの回り込みと同様に、高バンク角で横移動速度が発散しないようソフト飽和させる
+                float maxLatDriveG = 1.65f;
+                float tanAngleDrive = maxLatDriveG * (float)Math.Tanh(rawTanDrive / maxLatDriveG);
 
                 float angleBaseAccel = tanAngleDrive * cfg.g;
                 float dirSign = (Mathf.Abs(s.theta1) > 0.001f) ? Mathf.Sign(s.theta1) : Mathf.Sign(s.y_CoM);
 
                 bool isRightingMotion = (s.theta1 * s.omega1) < 0f;
-                float rightingFeedVel = isRightingMotion ? (-s.omega1 * s.z_CoM * 0.65f) : 0f;
-                float latStepFeedVel = dirSign * v_y_ext * 0.85f;
+                float rightingFeedVel = isRightingMotion ? (-s.omega1 * s.z_CoM * 0.45f) : 0f;
+                // 脚伸展時は台車が外側へ逃げるのを抑え（エッジを噛ませて支点を止め）、回転モーメントへ変換しやすくする
+                float latStepFeedVel = -dirSign * v_y_ext * 0.30f;
                 s.v_c_target = angleBaseAccel * baseGain5Deg * angleShapeFactor + rightingFeedVel + latStepFeedVel;
 
                 float carvingRetention = (s.gripState == SkiGripState.HipCrash || s.gripState == SkiGripState.BootOut)
@@ -766,14 +804,22 @@ namespace SkyTechSimulator
                 if (wasAtRailLimit)
                 {
                     float railSign = Mathf.Sign(s.x_c);
-                    if (railSign * ddx_c >= 0f)
+                    // 台車(レール端)から見て重心が外側へはみ出している距離 y_overhang (>0 でレール外)
+                    float y_overhang = railSign * s.y_CoM;
+
+                    // 股関節の屈曲や抜重によって、重心が台車の真上付近(例: 外側8cm以内)まで戻ってきたか？
+                    bool canCarriageSlideUnder = (y_overhang < 0.08f);
+
+                    if (railSign * ddx_c >= 0f || !canCarriageSlideUnder)
                     {
+                        // 重心が大きくレール外に残っているうちは、台車はレール端にロックされて体の下へ動けない
                         ddx_c = 0f;
                         s.v_c = 0f;
                         s.x_c = railSign * halfRail;
                     }
                     else
                     {
+                        // 重心を台車の上付近まで引き戻せたら、台車が内側（体の下）へ滑り込む動きを解禁する
                         s.v_c += ddx_c * dt;
                         s.x_c += s.v_c * dt;
                     }
@@ -870,16 +916,84 @@ namespace SkyTechSimulator
             else
             {
                 float tau_gravity = mg * s.y_CoM;
-                float tau_centrifugal = -cfg.M * s.a_c * s.z_CoM_ref;
+
+                // マウスを大きく動かしてローリングモーメントを優先発生させている時は、
+                // 遠心力による外向きの引き戻しモーメントを緩和して鉛直〜脚側へ倒れ込めるようにする
+                float centrifugalSuppress = 1.0f - Mathf.Clamp01(0.55f * forceOverride + 0.35f * headDiveFactor);
+                // 基準高さ z_CoM_ref ではなく実際の重心高さ z_CoM を使い、深い内傾角で遠心力トルクが過大になるのを防ぐ
+                float effectiveZForCentrifugal = Mathf.Lerp(s.z_CoM, s.z_CoM_ref, 0.25f);
+                float tau_centrifugal = -cfg.M * (s.a_c * centrifugalSuppress) * effectiveZForCentrifugal;
                 float tau_rail_impact = -cfg.M * ddx_c_impact * s.z_CoM;
 
+                // マウス方向への重心シフト駆動トルク ＋ 優先ローリングモーメント ＋ ヘッドダイブ巻き込みトルク
                 float tau_shift_drive = cfg.comShiftRollDriveGain * mg * s.dy_cmd;
+                float tau_mouse_roll_moment = cfg.mouseRollMomentGain * mg * maxShiftDesign * s.u_shift_filtered;
+                float tau_head_dive_drive = cfg.headDiveRollDriveGain * mg * s.l1 * headDiveFactor * Mathf.Sign(s.u_shift_filtered);
                 float tau_hip_reaction = cfg.hipReactionGain * s.tau_hip_steer;
 
-                float skidRightingPenalty = 1.0f - 0.85f * Mathf.Clamp01(s.skid_intensity);
-                float activeExtMotionGate = Mathf.Clamp01(v_com_ext / 0.25f);
-                float tau_ext_righting = (s.gripState == SkiGripState.RailLimitHit) ? 0f : -u_norm * activeExtMotionGate * skidRightingPenalty * (
-                    cfg.extRightingTorqueGain * (s.u_ext_actual * sinAbsTheta1 + 0.35f * s.F_lat_step) * s.l1 * Mathf.Sign(s.theta1)
+                // --- レール端付近での「台車を体の下に戻す運動」と引き起こしトルクの連動 ---
+                float railProximity = Mathf.Clamp01((Mathf.Abs(s.x_c) - (halfRail - 0.25f)) / 0.25f);
+                if (railProximity > 0.001f)
+                {
+                    float railSign = Mathf.Sign(s.x_c);
+
+                    // 1. 台車から見た重心の外側オーバーハング量 (m): > 0 なら重心が台車より外側
+                    float y_overhang = railSign * s.y_CoM;
+
+                    // 2. 重心と台車の相対接近速度 (m/s): 台車が体の下へ潜り込む or 重心が台車上へ戻る速度
+                    float dy_com_dt = (s.y_CoM - prev_y_CoM) / dt;
+                    float v_carriage_inward = Mathf.Max(0f, -railSign * s.v_c);
+                    float v_com_pullback = Mathf.Max(0f, -railSign * dy_com_dt);
+                    float v_under_recovery = v_carriage_inward + 0.65f * v_com_pullback;
+
+                    // 重心が外側へ 0.18m 以上はみ出していると位置ゲインは 0（完全に倒れる）。
+                    // 重心が台車直上(0m)〜内側(-0.08m)へ入るにつれて 0 -> 1 へ滑らかに立ち上がる。
+                    float posUnderFactor = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.18f, -0.06f, y_overhang));
+
+                    // 台車が実際に体の下へ滑り込む速度が出ているほど、引き起こしモーメントが強く増幅される
+                    // （ただし重心が大きく外へ外れている時は速度ゲインも効かないよう posUnderFactor を掛ける）
+                    float velUnderBoost = 1.0f + 1.35f * Mathf.Clamp01(v_under_recovery / 0.80f);
+                    float underBodyTorqueScale = Mathf.Clamp(posUnderFactor * velUnderBoost, 0f, 1.45f);
+
+                    // 現在のレール端接近度(railProximity)に応じてスケールを適用
+                    float effectiveScale = Mathf.Lerp(1.0f, underBodyTorqueScale, railProximity);
+
+                    // 起き上がり方向（-railSign方向）に働く人工トルクを「台車が体の下に戻れた度合い」に比例させる
+                    if (railSign * tau_shift_drive < 0f)
+                    {
+                        tau_shift_drive *= effectiveScale;
+                    }
+                    if (railSign * tau_hip_reaction < 0f)
+                    {
+                        tau_hip_reaction *= effectiveScale;
+                    }
+
+                    // さらに台車自体が内側(体の下)へ加速・移動できているときは、
+                    // 支点移動による物理的な復元慣性モーメント（台車が体の下へ潜り込む力）を追加する
+                    if (v_carriage_inward > 0.01f && posUnderFactor > 0.1f)
+                    {
+                        float tau_carriage_under = -railSign * cfg.M * (v_carriage_inward * 3.5f) * s.z_CoM * posUnderFactor * railProximity;
+                        tau_shift_drive += tau_carriage_under;
+                    }
+                }
+
+                // スキッド時のペナルティを緩和（0.85 -> 0.40）し、深いバンクからでも脚伸展で起き上がれるようにする
+                float skidRightingPenalty = 1.0f - 0.40f * Mathf.Clamp01(s.skid_intensity);
+                // 高Gで脚の伸展速度(v_com_ext)が出にくい領域でも、伸展筋力(u_ext_actual)が出ていればゲートを開く
+                float forceGate = Mathf.Clamp01(s.u_ext_actual / (1.2f * mg));
+                float activeExtMotionGate = Mathf.Clamp01(Mathf.Max(v_com_ext / 0.20f, forceGate * 0.85f));
+
+                // 脚伸展時の起き上がりトルク：マウスを脚側(クロスオーバー方向)へ動かしている時は増幅し、
+                // 逆(さらに深く倒す方向)へ動かしている時は邪魔をしないように抑制する
+                float extDirAlign = (s.theta1 * s.u_shift_filtered < -0.05f)
+                    ? (1.0f + 0.85f * Mathf.Abs(s.u_shift_filtered))
+                    : (1.0f - 0.80f * Mathf.Abs(s.u_shift_filtered));
+
+                // 横G(遠心力)が大きい状態で脚を伸ばしたとき、板のたわみ反発として横Gをロールモーメント(起き上がり回転)へ変換する項
+                float gReboundBoost = 1.0f + 0.45f * (Mathf.Abs(s.a_c) / cfg.g);
+
+                float tau_ext_righting = (s.gripState == SkiGripState.RailLimitHit) ? 0f : -u_norm * activeExtMotionGate * skidRightingPenalty * extDirAlign * gReboundBoost * (
+                    cfg.extRightingTorqueGain * (s.u_ext_actual * sinAbsTheta1 + 0.45f * s.F_lat_step) * s.l1 * Mathf.Sign(s.theta1)
                     + cfg.extVelocityRightingGain * mg * v_com_ext * Mathf.Sin(s.theta1)
                 );
 
@@ -914,41 +1028,29 @@ namespace SkyTechSimulator
                 }
                 else
                 {
-                    float rightingDampScale = 1.0f - 0.55f * Mathf.Max(u_norm * activeExtMotionGate, u_flex);
+                    float rightingDampScale = 1.0f - 0.65f * Mathf.Max(u_norm * activeExtMotionGate, Mathf.Max(u_flex, headDiveFactor));
                     dampingLinear = Mathf.Min(cfg.gamma_roll, 12.0f) * rightingDampScale;
                 }
                 float tau_damping = -dampingLinear * s.omega1;
 
-                float domega1 = (tau_gravity + tau_centrifugal + tau_rail_impact + tau_shift_drive + tau_hip_reaction
+                float domega1 = (tau_gravity + tau_centrifugal + tau_rail_impact
+                               + tau_shift_drive + tau_mouse_roll_moment + tau_head_dive_drive + tau_hip_reaction
                                + tau_ext_righting + tau_tuck_centering + tau_lock_servo + tau_damping) / s.I_eff;
                 s.omega1 += domega1 * dt;
                 s.theta1 += s.omega1 * dt;
                 s.theta1 = Mathf.Clamp(s.theta1, -85f * Mathf.Deg2Rad, 85f * Mathf.Deg2Rad);
 
                 float ddphi = (s.tau_hip_steer - tau_hip_load - cfg.kd_hip_steer * s.dphi) / I2_hip;
-                float maxHipVel = Mathf.Max(8.0f, cfg.dphi_max * (1.8f + 1.0f * shiftActivity));
+                float maxHipVel = Mathf.Max(10.0f, cfg.dphi_max * (2.0f + 1.5f * shiftActivity + 1.2f * headDiveFactor));
                 float dphi_raw = Mathf.Clamp(s.dphi + ddphi * dt, -maxHipVel, +maxHipVel);
 
-                float dphi_in_phase = angulationRatio * s.omega1;
-                if (shiftActivity > 0.01f)
-                {
-                    if (s.u_shift_filtered < 0f && s.omega1 < 0f)
-                    {
-                        dphi_raw = Mathf.Max(dphi_raw, dphi_in_phase);
-                    }
-                    else if (s.u_shift_filtered > 0f && s.omega1 > 0f)
-                    {
-                        dphi_raw = Mathf.Min(dphi_raw, dphi_in_phase);
-                    }
-                    s.dphi = Mathf.Lerp(dphi_raw, dphi_in_phase, 0.65f * shiftActivity);
-                }
-                else
-                {
-                    s.dphi = dphi_raw;
-                }
+                // ヘッドダイブ・マウス操作時は dphi_in_phase による同位相ブレーキを解除し、頭が先行して突っ込めるようにする
+                float inPhaseBlend = 0.65f * shiftActivity * (1.0f - forceOverride);
+                float dphi_in_phase = effectiveAngRatio * s.omega1;
+                s.dphi = Mathf.Lerp(dphi_raw, dphi_in_phase, inPhaseBlend);
 
-                s.phi = Mathf.Clamp(s.phi + s.dphi * dt, -phiMax, +phiMax);
-                if ((s.phi >= phiMax && s.dphi > 0f) || (s.phi <= -phiMax && s.dphi < 0f))
+                s.phi = Mathf.Clamp(s.phi + s.dphi * dt, minPhiLimit, maxPhiLimit);
+                if ((s.phi >= maxPhiLimit && s.dphi > 0f) || (s.phi <= minPhiLimit && s.dphi < 0f))
                 {
                     s.dphi = 0f;
                 }

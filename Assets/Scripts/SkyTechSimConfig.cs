@@ -241,6 +241,23 @@ namespace SkyTechSimulator
         [Tooltip("ロール回転の二乗抗力減衰係数 (N*m*s^2/rad^2: 高速な起き上がり反動を強力に抑制)")]
         public float gamma_quad = 45.0f;
 
+        [Header("6b. Mouse Roll Moment Priority & Head Dive (クロスオーバー突っ込み制御)")]
+        [Tooltip("画面中央から横方向へこの距離(m)マウスを動かすと最大ローリング指令(100%)になるアナログ操作幅")]
+        public float mouseSteerFullRange = 1.15f;
+
+        [Tooltip("マウス横入力時に重力・遠心力の合力バランス維持(外向傾ベース)を解除し、マウス方向への傾斜を優先する割合 [0..1]")]
+        [Range(0.0f, 1.0f)]
+        public float mouseForceOverrideRatio = 0.88f;
+
+        [Tooltip("マウス位置方向へ直接発生させる優先ローリングモーメントゲイン")]
+        public float mouseRollMomentGain = 2.40f;
+
+        [Tooltip("倒れた状態から『脚伸展 ＋ 脚側への大きなマウス移動』を行った際に、頭が脚側へ突っ込む追加体幹ダイブ角 (deg)")]
+        public float extHeadDiveMaxDeg = 38.0f;
+
+        [Tooltip("頭が脚側へ突っ込むモーションによって下部リンク(脚)をマウス方向へ巻き込んでロールさせる駆動ゲイン")]
+        public float headDiveRollDriveGain = 1.85f;
+
         [Header("7. Snow Shear Failure (雪面挫折スキッディング & 台車押し負け)")]
         [Tooltip("最小接地圧閾値 N_min (体重比 G単位)")]
         public float N_min_G = 0.25f;
