@@ -475,13 +475,32 @@ namespace SkyTechSimulator
             float x_c_prev = s.x_c;
             float v_c_prev = s.v_c;
             float v_c_free = v_c_prev + ((F_drive + s.skid_pushback_force + legPushForce + oncomingResist - c_glide * v_c_prev) / m_c) * dt;
-            s.x_c = Mathf.Clamp(x_c_prev + v_c_free * dt, -halfRail, halfRail);
-            s.v_c = (s.x_c - x_c_prev) / dt;
+
+            float x_c_unclamped = x_c_prev + v_c_free * dt;
+            bool hitStopper = Mathf.Abs(x_c_unclamped) > halfRail;
+            s.x_c = Mathf.Clamp(x_c_unclamped, -halfRail, halfRail);
+
+            const float stopperRestitution = 0.30f;
+            if (hitStopper && (x_c_unclamped * v_c_prev > 0f))
+            {
+                s.v_c = -v_c_prev * stopperRestitution;
+            }
+            else
+            {
+                s.v_c = (s.x_c - x_c_prev) / dt;
+            }
             float ddx_c = (s.v_c - v_c_prev) / dt;
+
+            // 車止めに達しており、かつ重心(y_CoM)が車止めと同じ外側へ出ているかを判定
+            // 右車止め(x_c >= halfRail)で y_CoM > 0、または左車止め(x_c <= -halfRail)で y_CoM < 0 のとき、
+            // 台車はそれ以上重心の下へ潜り込めないため outwardFreeGate = 0 となる
+            bool atRightStopperAndOutside = (s.x_c >=  halfRail - 1e-3f) && (s.y_CoM > 0f);
+            bool atLeftStopperAndOutside  = (s.x_c <= -halfRail + 1e-3f) && (s.y_CoM < 0f);
+            float outwardFreeGate = (atRightStopperAndOutside || atLeftStopperAndOutside) ? 0f : 1f;
 
             float v_req = Mathf.Abs(s.v_c_target);
             float v_realized = Mathf.Max(0f, Mathf.Sign(s.v_c_target) * s.v_c);
-            float eta_carriage = 1.0f - Mathf.Clamp01((v_req - v_realized) / Mathf.Max(0.20f, v_req));
+            float eta_carriage = outwardFreeGate * (1.0f - Mathf.Clamp01((v_req - v_realized) / Mathf.Max(0.20f, v_req)));
 
             // 連続グリップ係数と実効遠心加速度 a_c
             float N_min = cfg.N_min_G * mg;
@@ -508,45 +527,60 @@ namespace SkyTechSimulator
             }
             else
             {
-                float tau_gravity = mg * s.y_CoM;
-                float tau_carriage_com = -cfg.M * (0.35f * ddx_c + s.a_c) * s.z_CoM;
+                // --- A. まず股関節の角加速度 ddphi を計算する ---
+                float ddxCoupling = hitStopper ? 1.0f : 0.35f;
+                float tau_hip_impact = -m2_l2 * (ddxCoupling * ddx_c) * Mathf.Cos(theta2_cur);
 
-                // 外向傾(phi)を作った際に腰を逆方向へ押し戻してしまう成分を除去し、純粋な脚の横押し駆動トルクにする
+                // 車止めで外側へはみ出しているときは、重力に逆らって上体だけを無理やり起こすオーバーライドを制限
+                float effectiveHipSteer = s.tau_hip_steer * Mathf.Lerp(0.35f, 1.0f, outwardFreeGate);
+                float ddphi = (effectiveHipSteer - (tau_hip_load + tau_hip_impact) - cfg.kd_hip_steer * s.dphi) / I2_hip;
+
+                float maxHipVel = Mathf.Max(10.0f, cfg.dphi_max * (2.0f + 1.5f * shiftActivity));
+                float dphi_free = Mathf.Clamp(s.dphi + ddphi * dt, -maxHipVel, maxHipVel);
+                float phi_prev = s.phi;
+                s.phi = Mathf.Clamp(phi_prev + dphi_free * dt, minPhiLimit, maxPhiLimit);
+                s.dphi = (s.phi - phi_prev) / dt;
+                // クランプ後の実際の股関節角加速度（ロック端に達したら反作用も止まる）
+                float ddphi_actual = (s.dphi - (phi_prev == s.phi ? 0f : s.dphi)) / dt;
+                ddphi_actual = ddphi; // 可動域内では ddphi
+
+                // --- B. ブーツ支点(台車)まわりの脚リンク角加速度 domega1 を計算する ---
+                float tau_gravity = mg * s.y_CoM;
+                float tau_carriage_com = -cfg.M * (ddxCoupling * ddx_c + s.a_c) * s.z_CoM;
+
+                // ★重要：台車が車止めに阻まれて外側へ動けないとき(outwardFreeGate == 0)は、
+                // 脚で台車を押し返して重心を内側へ戻す駆動トルクは一切発生しない
                 float lowStanceBoost = 1.0f + 0.75f * (1.0f - s.s_rom);
                 float legSupportRatio = Mathf.Clamp(s.F_leg / mg, 0.35f, 1.8f);
                 float kp_leg_roll = cfg.comShiftRollDriveGain * cfg.mouseRollMomentGain * mg * s.l1 * lowStanceBoost * legSupportRatio;
                 float kd_leg_roll = 0.18f * kp_leg_roll;
-                float tau_leg_lateral_drive = kp_leg_roll * delta_theta1_cmd - kd_leg_roll * s.omega1;
+                float tau_leg_lateral_drive = outwardFreeGate * (kp_leg_roll * delta_theta1_cmd - kd_leg_roll * s.omega1);
 
-                // 台車が進んでくる方向と逆に脚で踏ん張ることで、重心を台車の向こう側（左）へ送り出すトルク
-                float oncomingPushTorque = s.u_shift_filtered * Mathf.Abs(s.v_c) * (0.45f * mg * s.z_CoM) * lowStanceBoost;
+                float oncomingPushTorque = outwardFreeGate * (s.u_shift_filtered * Mathf.Abs(s.v_c) * (0.45f * mg * s.z_CoM) * lowStanceBoost);
 
                 float skidRightingPenalty = 1.0f - 0.40f * s.skid_intensity;
                 float activeExtMotionGate = Mathf.Clamp01(Mathf.Max(v_com_ext / 0.20f, (s.u_ext_actual / (1.2f * mg)) * 0.85f));
-                // マウスで同方向へ倒し込んでいる最中は、伸展による直立戻しトルク(tau_leg_carriage_push)を抑制
                 float rightingSuppress = 1.0f - 0.80f * Mathf.Clamp01(s.u_shift_filtered * Mathf.Sign(s.theta1));
                 float tau_leg_carriage_push = -eta_carriage * activeExtMotionGate * skidRightingPenalty * rightingSuppress
                     * (cfg.extRightingTorqueGain * s.u_ext_actual * s.l1 + cfg.extVelocityRightingGain * mg * v_com_ext) * sin1;
 
-                // 股関節トルクによる脚リンクへの結合：外向傾(phi < 0)で腰が左(theta1 < 0)へ出るよう符号を一致させる
-                float tau_hip_carriage = -eta_carriage * (0.25f * cfg.hipReactionGain) * s.tau_hip_steer;
+                // ★重要：2リンク系の慣性連成反作用 (角運動量保存)
+                // theta2 = theta1 - phi なので、上体を内側に起こす角加速度(ddphi)は、
+                // 連成慣性モーメント I_couple を通じて脚(theta1)を同方向（外側へ倒れる方向）へ蹴り出す。
+                // 台車が自由に動ける通常滑走時はエッジグリップで受け止められるが、車止め停止時(outwardFreeGate == 0)は
+                // 100%脚へ反作用が跳ね返り、上体を起こそうとすると逆に腰が外側へ落ちて全体重心は戻らない。
+                float I_couple = I2_hip + cfg.m2 * s.l1 * cfg.l2 * Mathf.Cos(s.phi);
+                float tau_hip_inertial_reaction = Mathf.Lerp(1.0f, 0.25f, eta_carriage) * I_couple * ddphi;
+
                 float tau_damping = -Mathf.Min(cfg.gamma_roll, 10.0f) * s.omega1;
 
                 float domega1 = (tau_gravity + tau_carriage_com + tau_leg_lateral_drive + oncomingPushTorque
-                               + tau_leg_carriage_push + tau_hip_carriage + tau_damping) / s.I_eff;
+                               + tau_leg_carriage_push + tau_hip_inertial_reaction + tau_damping) / s.I_eff;
 
                 float theta1_prev = s.theta1;
                 float omega1_free = s.omega1 + domega1 * dt;
                 s.theta1 = Mathf.Clamp(theta1_prev + omega1_free * dt, -halfPi, halfPi);
                 s.omega1 = (s.theta1 - theta1_prev) / dt;
-
-                float ddphi = (s.tau_hip_steer - tau_hip_load - cfg.kd_hip_steer * s.dphi) / I2_hip;
-                float maxHipVel = Mathf.Max(10.0f, cfg.dphi_max * (2.0f + 1.5f * shiftActivity));
-                float dphi_free = Mathf.Clamp(s.dphi + ddphi * dt, -maxHipVel, maxHipVel);
-
-                float phi_prev = s.phi;
-                s.phi = Mathf.Clamp(phi_prev + dphi_free * dt, minPhiLimit, maxPhiLimit);
-                s.dphi = (s.phi - phi_prev) / dt;
 
                 s.P_hip_steer = Mathf.Abs(s.tau_hip_steer * s.dphi);
                 s.phi_bend = s.phi - phi_ref;
