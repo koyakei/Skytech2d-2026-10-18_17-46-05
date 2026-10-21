@@ -308,89 +308,42 @@ public class SkyTechGameController : MonoBehaviour
         }
         else if (hasMouseWorld && Config != null)
         {
-            float targetL1;
+            float dy = mouseWorld.y - screenCenterWorld.y;
+            float neutralL1 = Mathf.Clamp(Config.l_max - Config.supportDropFromMaxMeters, Config.l_min, Config.l_max);
 
-            switch (HeightControlMode)
+            float targetL1 = HeightControlMode switch
             {
-                case MouseHeightControlMode.VerticalSignedFromCenter:
-                {
-                    // 画面の上下中央 (screenCenterWorld.y) を基準高さ (l_hold) とし、
-                    // 上方向で l_max (伸長)、下方向で l_min (短縮)
-                    float dy = mouseWorld.y - screenCenterWorld.y;
-                    float drop = Config.supportDropFromMaxMeters;
-                    float neutralL1 = Mathf.Clamp(Config.l_max - drop, Config.l_min, Config.l_max);
+                MouseHeightControlMode.VerticalSignedFromCenter =>
+                    neutralL1 + Mathf.Clamp(dy / Mathf.Max(0.05f, dy >= 0f ? MouseExtendUpRange : MouseFlexDownRange), -1f, 1f)
+                              * (dy >= 0f ? (Config.l_max - neutralL1) : (neutralL1 - Config.l_min)),
 
-                    if (dy >= 0f)
-                    {
-                        float upRange = Mathf.Max(0.05f, MouseExtendUpRange);
-                        float tUp = Mathf.Clamp01(dy / upRange);
-                        targetL1 = Mathf.Lerp(neutralL1, Config.l_max, tUp);
-                    }
-                    else
-                    {
-                        float downRange = Mathf.Max(0.05f, MouseFlexDownRange);
-                        float tDown = Mathf.Clamp01((-dy) / downRange);
-                        targetL1 = Mathf.Lerp(neutralL1, Config.l_min, tDown);
-                    }
-                    break;
-                }
+                MouseHeightControlMode.VerticalDistanceFromCenter =>
+                    Mathf.Lerp(Config.l_max, Config.l_min, Mathf.InverseLerp(MouseFullExtendDist, MouseFullFlexDist, Mathf.Abs(dy))),
 
-                case MouseHeightControlMode.VerticalDistanceFromCenter:
-                {
-                    // 画面の上下中央 (screenCenterWorld.y) からの垂直距離 |dy| で制御
-                    float vertDist = Mathf.Abs(mouseWorld.y - screenCenterWorld.y);
-                    float nearDist = Mathf.Max(0.02f, MouseFullExtendDist);
-                    float farDist = Mathf.Max(nearDist + 0.10f, MouseFullFlexDist);
-                    float tDist = Mathf.InverseLerp(nearDist, farDist, vertDist);
-                    targetL1 = Mathf.Lerp(Config.l_max, Config.l_min, tDist);
-                    break;
-                }
-
-                case MouseHeightControlMode.DistanceFromScreenCenter:
-                default:
-                {
-                    // 画面の中心座標 (screenCenterWorld.x, screenCenterWorld.y) からの距離で制御
-                    float distToCenter = Vector2.Distance(mouseWorld, screenCenterWorld);
-                    float nearDist = Mathf.Max(0.05f, MouseFullExtendDist);
-                    float farDist = Mathf.Max(nearDist + 0.10f, MouseFullFlexDist);
-                    float tDist = Mathf.InverseLerp(nearDist, farDist, distToCenter);
-                    targetL1 = Mathf.Lerp(Config.l_max, Config.l_min, tDist);
-                    break;
-                }
-            }
+                _ =>
+                    Mathf.Lerp(Config.l_max, Config.l_min, Mathf.InverseLerp(MouseFullExtendDist, MouseFullFlexDist, Vector2.Distance(mouseWorld, screenCenterWorld)))
+            };
 
             _input.l1_target = targetL1;
 
-            float lengthError = targetL1 - _state.l1;
-            const float lengthDeadband = 0.004f;
+            // 位置誤差から現在の速度(dl1)を差し引いてオーバーシュートを防ぎ、二乗特性(drive * |drive|)で中央付近を滑らかに鎮静化
+            float dampedError = (targetL1 - _state.l1) - 0.08f * _state.dl1;
+            float linDrive = Mathf.Clamp(dampedError / 0.12f, -1.0f, 1.0f);
+            float smoothDrive = linDrive * Mathf.Abs(linDrive);
 
-            if (lengthError > lengthDeadband || targetL1 >= Config.l_max - 0.005f)
+            // 上端(l_max)・下端(l_min)付近へ大きく動かしたときのみフル出力へ滑らかにブースト
+            float topBoost    = Mathf.SmoothStep(0f, 1f, (targetL1 - (Config.l_max - 0.03f)) / 0.025f);
+            float bottomBoost = Mathf.SmoothStep(0f, 1f, ((Config.l_min + 0.03f) - targetL1) / 0.025f);
+
+            float extTarget  = Mathf.Max(Mathf.Max(0f, smoothDrive), topBoost);
+            float flexTarget = Mathf.Max(Mathf.Max(0f, -smoothDrive), bottomBoost);
+
+            _input.u_ext_norm  = Mathf.MoveTowards(_input.u_ext_norm,  extTarget,  35.0f * Time.deltaTime);
+            _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, flexTarget, 24.0f * Time.deltaTime);
+
+            if (_input.u_ext_norm > 0.15f && !qHeld && !eHeld && _state.snow_stress_ratio < 0.9f)
             {
-                float extDrive = (targetL1 >= Config.l_max - 0.005f)
-                    ? 1.0f
-                    : Mathf.Clamp01(lengthError / 0.06f);
-
-                _input.u_ext_norm = Mathf.MoveTowards(_input.u_ext_norm, extDrive, 45.0f * Time.deltaTime);
-                _input.u_flex_norm = 0f;
-
-                if (_input.u_ext_norm > 0.1f && !qHeld && !eHeld && _state.gripState != SkiGripState.Skidding && _state.snow_stress_ratio < 0.9f)
-                {
-                    _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 35.0f * Time.deltaTime);
-                }
-            }
-            else if (lengthError < -lengthDeadband || targetL1 <= Config.l_min + 0.005f)
-            {
-                float flexDrive = (targetL1 <= Config.l_min + 0.005f)
-                    ? 1.0f
-                    : Mathf.Clamp01(-lengthError / 0.06f);
-
-                _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, flexDrive, 24.0f * Time.deltaTime);
-                _input.u_ext_norm = 0f;
-            }
-            else
-            {
-                _input.u_ext_norm = 0f;
-                _input.u_flex_norm = 0f;
+                _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 35.0f * Time.deltaTime);
             }
         }
         else
