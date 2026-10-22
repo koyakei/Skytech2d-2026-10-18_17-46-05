@@ -13,14 +13,14 @@ namespace SkyTechSimulator
         [Tooltip("重力加速度 (m/s^2)")]
         public float g = 9.81f;
 
-        [Tooltip("キャリッジ（台車）自体の質量 m_c (kg) ※大きいほど切り返し時の急加速が重厚・マイルドになる")]
-        public float carriageMass = 15.0f;
+        [Tooltip("キャリッジ（台車）自体の質量 m_c (kg) ※20度未満の浅い角度でも台車が遅れず足元へ追従するように軽量化 (5.0f)")]
+        public float carriageMass = 5.0f;
 
         [Tooltip("SkyTechSportキャリッジ有効レール幅 (m) [-W_rail/2, +W_rail/2: 7.20m]")]
         public float W_rail = 7.20f;
 
-        [Tooltip("仮想横加速度 a_c からキャリッジ実移動加速度へのスケーリング係数 (5度で3km/h)")]
-        public float railScale = 4.87f;
+        [Tooltip("仮想横加速度 a_c からキャリッジ実移動加速度へのスケーリング係数 (ロール角に対する台車目標速度の全体倍率)")]
+        public float railScale = 6.20f;
 
         [Tooltip("キャリッジの中央復元バネ定数 (1/s^2: 0.0で中央引き戻しをなくし一定速度で横移動)")]
         public float k_center = 0.0f;
@@ -28,40 +28,40 @@ namespace SkyTechSimulator
         [Tooltip("キャリッジの速度応答減衰係数 (1/s: 4.0で目標速度への追従時定数0.25s)")]
         public float c_center = 4.0f;
 
-        [Tooltip("仮想スキーの基準サイドカット半径 (m)")]
-        public float R_sc = 15.0f;
+        [Tooltip("仮想スキーの基準サイドカット半径 (m) ※howeTanDrive の係数(15.0 / R_sc)を増やし、Tanh飽和を利用して浅い角度の初速を強化")]
+        public float R_sc = 10.5f;
 
-        [Tooltip("仮想斜面の平均勾配 (deg)")]
-        public float alphaDeg = 18.0f;
+        [Tooltip("仮想斜面の平均勾配 (deg) ※ターン前半(倒れ込み時)に台車速度を逆方向へ引き戻すブレーキ項(slopeHysteresisVel)を緩和")]
+        public float alphaDeg = 10.0f;
 
         [Tooltip("雪面とスキー板の動摩擦係数")]
         public float mu_snow = 0.04f;
 
-        [Tooltip("フラット付近(theta1 ≈ 0)の符号反転緩和デッドゾーン角 (deg)")]
-        public float theta_deadDeg = 1.5f;
+        [Tooltip("フラット付近(theta1 ≈ 0)の符号反転緩和デッドゾーン角 (deg) ※直立付近の不感帯を最小化")]
+        public float theta_deadDeg = 0.5f;
 
-        [Tooltip("台車の左右移動を開始する最小ロール角デッドゾーン (deg: 2.0度までは台車の左右の動きが出ない)")]
-        public float carriageDeadzoneDeg = 2.0f;
+        [Tooltip("台車の左右移動を開始する最小ロール角デッドゾーン (deg: 直立付近の不感帯を最小化し即座に立ち上げる)")]
+        public float carriageDeadzoneDeg = 0.5f;
 
         [Header("2. Modified Howe Flex Curve (30 deg = 2G, 70 deg = 5G)")]
-        [Tooltip("基準横G係数 G0 (p=1.0, k_flex=0.6395 のとき 30度で2.0G, 70度で5.0G)")]
-        public float G0_curve = 3.778f;
+        [Tooltip("基準横G係数 G0 ※浅い角度から身体を起こす基準横G(G_base)を底上げ")]
+        public float G0_curve = 4.30f;
 
-        [Tooltip("深バンクたわみ曲率係数 k_flex: cos(k_flex * theta1)")]
-        public float k_flex = 0.295f;
+        [Tooltip("深バンクたわみ曲率係数 k_flex ※深バンク角(70度付近)での急激なGの跳ね上がりをマイルドに抑制")]
+        public float k_flex = 0.15f;
 
-        [Tooltip("低バンク領域の立ち上がり指数 p (1.0=標準比例, 1.2=低角さらに抑え目)")]
-        public float sinPower_p = 1.0f;
+        [Tooltip("低バンク領域の立ち上がり指数 p ※sin^p(|theta1|) の指数を下げ、浅いロール角(5〜20度)の台車速度と復原力を約2倍に増幅")]
+        public float sinPower_p = 0.55f;
 
         [Tooltip("2G/5G出力の基準となる滑走速度 V_ref (m/s)")]
         public float V_ref = 15.0f;
 
         [Header("3. Unstable Saddle & Active Load Maintenance (Surf/Bike Feel)")]
-        [Tooltip("要求軸方向荷重に対する実効ゲート係数 (伸展入力OFFで内倒、ONで5G維持となる閾値調整)")]
-        public float loadSustainScale = 0.72f;
+        [Tooltip("要求軸方向荷重に対する実効ゲート係数 ※強く脚を伸展させなくても、傾くだけで安定した復原横Gを維持")]
+        public float loadSustainScale = 0.48f;
 
-        [Tooltip("踏み込み不足時に遠心力が抜ける非線形べき乗指数 q")]
-        public float loadSustainPower_q = 1.65f;
+        [Tooltip("踏み込み不足時に遠心力が抜ける非線形べき乗指数 q ※荷重変化に対する横G抜けを穏やかにし、内倒クラッシュを防止")]
+        public float loadSustainPower_q = 1.00f;
 
         [Tooltip("強い踏み込み時の最大たわみオーバードライブ上限")]
         public float lambda_max = 1.55f;
@@ -73,8 +73,8 @@ namespace SkyTechSimulator
         [Tooltip("外向傾(くの字姿勢 phi > 0)による有効モーメントアーム増幅係数")]
         public float k_ang_boost = 0.15f;
 
-        [Tooltip("エッジ噛み込みから遠心力立ち上がりまでの一次遅れ時定数 (s)")]
-        public float tau_G_lag = 0.04f;
+        [Tooltip("エッジ噛み込みから遠心力立ち上がりまでの一次遅れ時定数 (s) ※遠心力発生までの遅れを最小化")]
+        public float tau_G_lag = 0.015f;
 
         [Header("4. Two-CoM Body Segment Parameters")]
         [Tooltip("スキーヤー総質量 M = m1 + m2 (kg)")]
@@ -226,6 +226,15 @@ namespace SkyTechSimulator
         [Tooltip("股関節PDサーボ微分ゲイン (N*m*s/rad)")]
         public float kd_hip = 55.0f;
 
+        [Header("6c. Neuromuscular Co-contraction & Adaptive Damping (適応ダンピング)")]
+        [Tooltip("筋同時収縮(Co-contraction)による適応ダンピング最大ブースト倍率")]
+        [Range(0.0f, 5.0f)]
+        public float adaptiveDampingBoost = 3.5f;
+
+        [Tooltip("筋同時収縮によるダンピングが最大に達する角速度閾値 (rad/s)")]
+        [Range(0.1f, 5.0f)]
+        public float coContractionVelThreshold = 1.0f;
+
         [Tooltip("股関節の最大発揮トルク上限 (N*m)")]
         public float tau_hip_max = 350.0f;
 
@@ -317,6 +326,19 @@ namespace SkyTechSimulator
 
         [Tooltip("抱え込みによって台車が中央へ戻る際、脚リンクも中央(0度)へ引き戻す連動ゲイン")]
         public float tuckRollCenteringGain = 8.0f;
+
+        [Header("9. Shallow-Angle Capture-Point & Camber Physics (①・③・④ 浅角引き起こし物理)")]
+        [Tooltip("① 倒れ込み角速度 ω1 に対して台車が重心落下予測点(Capture Point)へ先行して潜り込むゲイン")]
+        [Range(0.0f, 2.5f)]
+        public float capturePointLeadGain = 1.25f;
+
+        [Tooltip("③ 浅い角度(0〜15度)におけるキャンバー初期接地の台車追従スティフネス下限比 (初動遅れを解消)")]
+        [Range(0.35f, 1.0f)]
+        public float shallowGlideStiffnessMinRatio = 0.72f;
+
+        [Tooltip("④ 台車加速途中でもエッジ角に応じて直接立ち上がるカービング遠心力の最低保証比 (浅角での引き起こし抜け防止)")]
+        [Range(0.0f, 1.0f)]
+        public float directCarveRightingFloor = 0.65f;
 
         // --- 計算プロパティ（派生物理量・ラジアン変換キャッシュ） ---
 
