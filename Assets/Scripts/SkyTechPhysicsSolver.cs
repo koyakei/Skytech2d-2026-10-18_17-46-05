@@ -116,10 +116,7 @@ namespace SkyTechSimulator
         private static float SoftMax(float a, float b, float eps = 1e-5f) =>
             0.5f * (a + b + Mathf.Sqrt((a - b) * (a - b) + eps * eps));
 
-        /// <summary>
-        /// 区間内部 (minVal, maxVal) で厳密に恒等写像となる解析的クランプ関数:
-        /// 0.5 * (a + b + sqrt((x - a)^2 + eps^2) - sqrt((x - b)^2 + eps^2))
-        /// </summary>
+        /// <summary>区間内部 (minVal, maxVal) で厳密に恒等写像となる解析的クランプ関数</summary>
         private static float AnalyticClamp(float x, float minVal, float maxVal, float eps = 1e-5f)
         {
             float da = x - minVal;
@@ -134,7 +131,7 @@ namespace SkyTechSimulator
         private static float AnalyticStep(float x, float center, float width) =>
             0.5f * (1.0f + (float)Math.Tanh((x - center) / SoftMax(1e-5f, width)));
 
-        /// <summary>普遍整関数 Φ_0(z) = cosh(sqrt(z)) のテイラー展開（z の正負・ゼロを問わず分岐なしで厳密）</summary>
+        /// <summary>普遍整関数 Φ_0(z) = cosh(sqrt(z)) のテイラー展開</summary>
         private static float Phi0(float z) =>
             1.0f + z * (0.5f + z * ((1.0f / 24.0f) + z * ((1.0f / 720.0f) + z * (1.0f / 40320.0f))));
 
@@ -151,8 +148,6 @@ namespace SkyTechSimulator
 
         /// <summary>
         /// 2階線形微分方程式 d^2q/dt^2 + 2*gamma*dq/dt + omega0Sq*(q - qEq) = fExt の厳密解析解プロパゲータ。
-        /// omega0Sq = 0（純粘性系）、omega0Sq > 0（バネ減衰系）、omega0Sq < 0（倒立振子系）のすべてにおいて
-        /// ゼロ除算や桁落ちを一切起こさず、境界 [qMin, qMax] を含めて単一式で積分します。
         /// </summary>
         private static void SolveSecondOrderBoundedExact(
             ref float q,
@@ -177,11 +172,8 @@ namespace SkyTechSimulator
             float p0 = Phi0(z);
             float p1 = Phi1(z);
 
-            // 速度グリーン関数 G1(dt) とその時間微分 G0(dt)
             float G1 = expFactor * dt * p1;
             float G0 = expFactor * (p0 - gdt * p1);
-
-            // 変位グリーン関数 G2(dt) = \int_0^{dt} G1(\tau) d\tau （omega0Sq での除算を含まない整関数展開）
             float G2 = expFactor * dt * dt * (
                 0.5f
                 + (1.0f / 6.0f) * gdt
@@ -190,13 +182,10 @@ namespace SkyTechSimulator
                 + (1.0f / 720.0f) * z * z
             );
 
-            // 初期加速度 a_init = f0 - 2*g*v を用いた状態更新:
-            // q(t+dt) = q + (G1 + 2*g*G2)*v + G2*(f0 - 2*g*v) = q + G1*v + G2*f0
             float qFree = q + G1 * v + G2 * f0;
             float vFree = G0 * v + G1 * f0 - w2dt2 * (G2 / dt) * v;
 
             float qClamped = AnalyticClamp(qFree, qMin, qMax);
-            // 境界内にいるときは 1、境界端で外向きに押し付けられているときは 0 になる解析的ゲート
             float inBoundsGate = AnalyticStep(qFree - qMin, 0.0f, 1e-4f) * AnalyticStep(qMax - qFree, 0.0f, 1e-4f);
 
             a = (vFree - v) / dt;
@@ -345,7 +334,7 @@ namespace SkyTechSimulator
             float cos1 = Mathf.Cos(s.theta1);
 
             // =========================================================================
-            // 1. 基準姿勢 θ_{2,ref} と 重心シフト入力の1階解析解
+            // 1. 基準姿勢 θ_{2,ref} と 「起き上がり(頭先行) / 倒れ込み(腰先行)」の解析的目標生成
             // =========================================================================
             float gReset   = BoolGate(input.w_reset);
             float gNeutral = BoolGate(input.steer_neutral_cmd);
@@ -355,7 +344,6 @@ namespace SkyTechSimulator
             float tauShift = SoftMax(0.01f, cfg.comShiftResponseTau);
             float prev_u_shift = s.u_shift_filtered;
             s.u_shift_filtered = (1.0f - gReset) * SolveFirstOrderExact(prev_u_shift, u_x, tauShift, safeDt);
-            // 重心シフトの瞬間的な変化率（定常保持時は 0 になる）
             float du_shift_rate = (s.u_shift_filtered - prev_u_shift) / safeDt;
 
             float shiftActivity = AnalyticClamp01(SoftMax(Mathf.Abs(u_x), Mathf.Abs(s.u_shift_filtered)));
@@ -404,15 +392,29 @@ namespace SkyTechSimulator
 
             float delta_theta1_cmd = Mathf.Asin(AnalyticClamp(sin1 + s.dy_cmd / L_eff, -0.99f, 0.99f)) - s.theta1;
 
-            float lowPostureFactor = 1.0f - s.s_rom;
-            float crossOverGate = AnalyticClamp01((-s.theta1 * s.u_shift_filtered) / (15.0f * Mathf.Deg2Rad));
-            float extIntent = AnalyticClamp01(SoftMax(input.u_ext_norm, s.dl1 / 0.35f)) * s.s_rom;
-            float headDiveRad = s.u_shift_filtered * (cfg.extHeadDiveMaxDeg * Mathf.Deg2Rad) * (0.25f * extIntent * crossOverGate);
+            // ★解析的起き上がりゲート chi_up ∈ [0, 1]
+            // ・垂直(theta1 ≈ 0)からロール角を増す時（theta1 * u_shift >= 0）: chi_up = 0（腰から重心を動かす）
+            // ・傾いた状態から垂直方向へ起き上がる時（theta1 * u_shift <  0）: chi_up -> 1（頭を先に動かす）
+            float tiltDir  = SmoothSign(s.theta1, 6.0f * Mathf.Deg2Rad);
+            float shiftDir = SmoothSign(s.u_shift_filtered, 0.12f);
+            float chi_up   = AnalyticClamp01(SoftPlus(-tiltDir * shiftDir));
 
+            float lowPostureFactor = 1.0f - s.s_rom;
             float effectiveAngRatio = AnalyticClamp(angulationRatio + 0.35f * lowPostureFactor, 0.35f, 0.90f);
-            float minPhiLimit = SoftMin(-phiMax, cfg.phi_in_maxRad * 1.35f);
-            float maxPhiLimit = SoftMax( phiMax, -cfg.phi_in_maxRad * 1.35f);
-            float phi_target = (1.0f - gReset) * AnalyticClamp(effectiveAngRatio * (s.theta1 + delta_theta1_cmd) - headDiveRad, minPhiLimit, maxPhiLimit);
+
+            // 起き上がり時(chi_up > 0)は delta_theta1_cmd に対する股関節目標角の係数を +effectiveAngRatio から -1.35f へ反転させ、
+            // 体幹(頭 theta2 = theta1 - phi)を腰より先に起き上がり方向へ大きくリードさせる
+            float extIntent = AnalyticClamp01(SoftMax(input.u_ext_norm, s.dl1 / 0.35f));
+            float headLeadRad = chi_up * s.u_shift_filtered * (cfg.extHeadDiveMaxDeg * Mathf.Deg2Rad) * (0.55f + 0.45f * extIntent);
+            float cmdToPhiGain = Mathf.Lerp(effectiveAngRatio, -1.35f, chi_up);
+
+            // 深いバンクから頭を先に起こす際も股関節リミットで詰まらないよう可動域を chi_up に応じて拡張
+            float dynamicPhiExpand = chi_up * 0.40f;
+            float minPhiLimit = SoftMin(-phiMax, cfg.phi_in_maxRad * 1.35f) - dynamicPhiExpand;
+            float maxPhiLimit = SoftMax( phiMax, -cfg.phi_in_maxRad * 1.35f) + dynamicPhiExpand;
+
+            float rawPhiTarget = effectiveAngRatio * s.theta1 + cmdToPhiGain * delta_theta1_cmd - headLeadRad;
+            float phi_target = (1.0f - gReset) * AnalyticClamp(rawPhiTarget, minPhiLimit, maxPhiLimit);
 
             // =========================================================================
             // 2. 下肢伸縮運動方程式 (l1, dl1) の解析解
@@ -439,7 +441,6 @@ namespace SkyTechSimulator
             float fadeWidth = SoftMax(0.005f, cfg.supportFadeWidthMeters);
             float hasTargetGate = AnalyticStep(input.l1_target, 0.05f, 0.015f);
             float defaultHold = cfg.l_max - dropHold;
-            // Sキー押下時（hasTargetGate == 0 かつ u_flex > 0）も目標保持長 l_hold が滑らかに l_min へ移行する
             float keyHold = Mathf.Lerp(defaultHold, cfg.l_min, u_flex);
             float l_hold = Mathf.Lerp(keyHold, AnalyticClamp(input.l1_target, cfg.l_min, cfg.l_max), hasTargetGate);
 
@@ -458,7 +459,6 @@ namespace SkyTechSimulator
             float springArg = (cfg.k_passive * Mathf.Abs(posError) + 1.0f) / SoftMax(1.0f, maxSpringForce);
             float secantSaturation = (float)Math.Tanh(springArg) / springArg;
 
-            // 現在の脚長 s.l1 が目標保持長 l_hold より上にある（実際に縮んでいる）最中のみ抜重し、低姿勢到達後はしっかり踏力を維持する
             float movingDownGate = AnalyticClamp01((s.l1 - l_hold) / 0.04f);
             float flexUnweightGate = movingDownGate * (1.0f - 0.65f * shiftActivity);
             float u_flex_eff = u_flex * flexUnweightGate;
@@ -552,7 +552,7 @@ namespace SkyTechSimulator
             float skidTau = Mathf.Lerp(recTau, 0.025f, skidOnset);
             s.skid_intensity = SolveFirstOrderExact(s.skid_intensity, targetSkid, skidTau, safeDt);
 
-            // 台車の運動方程式: m_c * d^2(x_c)/dt^2 + c_glide * d(x_c)/dt + k_center * x_c = F_drive + ...
+            // 台車の運動方程式
             float m_c = SoftMax(1.0f, cfg.carriageMass);
             float effectiveAngle = SoftMax(absTheta1, absPsi);
             const float C_rail = 75.0f;
@@ -562,8 +562,8 @@ namespace SkyTechSimulator
             float angleShapeFactor = Mathf.Lerp(1.0f, 0.40f, AnalyticClamp01((effectiveAngle - 5f * Mathf.Deg2Rad) / (25f * Mathf.Deg2Rad)))
                                    + 0.35f * (sinRoll * sinRoll);
 
-            // 低姿勢時でも重心角度 y_CoM / z_CoM に加えて目標シフト dy_cmd がエッジ駆動力へ滑らかに寄与する
-            float rawTanDrive = (s.y_CoM + 0.35f * s.dy_cmd) / SoftMax(0.18f, s.z_CoM);
+            float rollInAssist = (1.0f - chi_up) * 0.25f * s.dy_cmd;
+            float rawTanDrive = (s.y_CoM + rollInAssist) / SoftMax(0.18f, s.z_CoM);
             float tanAngleDrive = 1.65f * (float)Math.Tanh(rawTanDrive / 1.65f);
             s.v_c_target = (tanAngleDrive * cfg.g) * 1.217f * angleShapeFactor;
 
@@ -578,8 +578,7 @@ namespace SkyTechSimulator
             float dynamicFootForce = (s.P_leg_ext / SoftMax(0.3f, v_max_eff)) * sinAbsTheta1;
             s.skid_pushback_force = -dirSign * cfg.carriagePushbackGain * inertiaMassRatio * dynamicFootForce * s.skid_intensity;
 
-            // 重心シフトの過渡速度 du_shift_rate にのみ比例する瞬間反作用（定常保持時は 0 となり逆走を引き起こさない）
-            float transientShiftImpulse = -cfg.M * maxShiftDesign * du_shift_rate * 0.25f * inertiaMassRatio;
+            float transientShiftImpulse = -cfg.M * maxShiftDesign * du_shift_rate * 0.20f * (1.0f - chi_up) * inertiaMassRatio;
 
             float halfRail = cfg.W_rail * 0.5f;
             float v_c_prev = s.v_c;
@@ -593,14 +592,12 @@ namespace SkyTechSimulator
                 -halfRail, halfRail, safeDt
             );
 
-            // レール端ストッパー接触時の反発（係数 0.30）を連続ゲートで融合
             float atRailEndGate = AnalyticStep(Mathf.Abs(s.x_c), halfRail - 1e-3f, 5e-4f);
             float pushingOutwardGate = AnalyticStep(s.x_c * v_c_prev, 0.0f, 1e-3f);
             float bounceGate = atRailEndGate * pushingOutwardGate;
             s.v_c = Mathf.Lerp(s.v_c, -0.30f * v_c_prev, bounceGate);
             float ddx_c = (s.v_c - v_c_prev) / safeDt;
 
-            // 車止め端に達し、かつ重心が同じ外側にあるときのみ 0 になる連続ゲート
             float outsideSameSide = AnalyticStep(s.x_c * s.y_CoM, 0.0f, 2e-3f);
             float outwardFreeGate = 1.0f - atRailEndGate * outsideSameSide;
 
@@ -634,8 +631,9 @@ namespace SkyTechSimulator
             float tau_hip_load = m2_l2 * (cfg.g * Mathf.Sin(theta2_cur) - s.a_c * Mathf.Cos(theta2_cur));
             float tau_hip_ff   = (1.0f - gReset) * m2_l2 * (cfg.g * Mathf.Sin(theta2_target) - s.a_c * (1.0f - 0.85f * forceOverride) * Mathf.Cos(theta2_target));
 
-            float kp_hip_eff = SoftMax(600.0f, cfg.kp_hip * 1.4f) * (1.0f + 1.25f * shiftActivity);
-            float kd_hip_eff = SoftMax(45.0f, cfg.kd_hip * 1.2f);
+            // 起き上がり時(chi_up > 0)は頭が素早く先行できるよう股関節サーボの応答性を強化
+            float kp_hip_eff = SoftMax(600.0f, cfg.kp_hip * 1.4f) * (1.0f + 1.25f * shiftActivity + 0.85f * chi_up);
+            float kd_hip_eff = SoftMax(45.0f, cfg.kd_hip * 1.2f) * (1.0f + 0.25f * chi_up);
 
             float steerScale = (1.0f - gReset) * Mathf.Lerp(0.35f, 1.0f, outwardFreeGate);
             float rawHipSteer = tau_hip_ff + kp_hip_eff * (phi_target - s.phi) - kd_hip_eff * s.dphi;
@@ -659,7 +657,23 @@ namespace SkyTechSimulator
             float tau_carriage_com = -(1.0f - gReset) * cfg.M * (ddxCoupling * ddx_c + s.a_c) * s.z_CoM;
 
             float lowStanceBoost = 1.0f + 0.75f * (1.0f - s.s_rom);
-            float oncomingPushTorque = (1.0f - gReset) * outwardFreeGate * (s.u_shift_filtered * Mathf.Abs(s.v_c) * (0.45f * mg * s.z_CoM) * lowStanceBoost);
+            float legSupportRatio = AnalyticClamp(s.F_leg / mg, 0.50f, 1.8f);
+            float kp_leg_roll = outwardFreeGate * cfg.comShiftRollDriveGain * cfg.mouseRollMomentGain * mg * l_eq_safe * lowStanceBoost * legSupportRatio;
+            float kd_leg_roll = 0.18f * kp_leg_roll;
+
+            // ★「倒れ込み＝腰先行」と「起き上がり＝頭先行・腰追従」の駆動モーメント融合：
+            // 1) 垂直からロール角を増す時(chi_up == 0): delta_theta1_cmd が直接腰(theta1)を駆動する（今の挙動）
+            // 2) 起き上がる時(chi_up -> 1): 腰の直接駆動を抑え(15%)、実際に頭(theta2)が基準外向傾位置から
+            //    起き上がり方向へ先行移動した角度 headLeadActual に引っ張られて腰(theta1)が後から起き上がる
+            float headLeadDisplacement = effectiveAngRatio * s.theta1 - s.phi;
+            float headLeadActual = shiftDir * SoftPlus(shiftDir * headLeadDisplacement);
+            float headPullDrive  = 0.15f * delta_theta1_cmd + cfg.headDiveRollDriveGain * headLeadActual;
+            float effectiveLegDriveCmd = Mathf.Lerp(delta_theta1_cmd, headPullDrive, chi_up);
+
+            float tau_leg_lateral_drive = (1.0f - gReset) * kp_leg_roll * effectiveLegDriveCmd;
+
+            float oncomingPushTorque = (1.0f - gReset) * outwardFreeGate * (1.0f - 0.70f * chi_up)
+                                     * (s.u_shift_filtered * Mathf.Abs(s.v_c) * (0.45f * mg * s.z_CoM) * lowStanceBoost);
 
             float skidRightingPenalty = 1.0f - 0.40f * s.skid_intensity;
             float activeExtMotionGate = AnalyticClamp01(SoftMax(v_com_ext / 0.20f, (s.u_ext_actual / (1.2f * mg)) * 0.85f));
@@ -667,12 +681,14 @@ namespace SkyTechSimulator
             float tau_leg_carriage_push = -(1.0f - gReset) * eta_carriage * activeExtMotionGate * skidRightingPenalty * rightingSuppress
                 * (cfg.extRightingTorqueGain * s.u_ext_actual * s.l1 + cfg.extVelocityRightingGain * mg * v_com_ext) * sin1;
 
+            // 頭が起き上がり方向へ加速する瞬間の慣性反作用により、動き始めは腰がその場に留まり頭が先に抜ける
             float I_couple = I2_hip + cfg.m2 * s.l1 * cfg.l2 * Mathf.Cos(s.phi);
-            float tau_hip_inertial_reaction = (1.0f - gReset) * Mathf.Lerp(1.0f, 0.25f, eta_carriage) * I_couple * ddphi;
+            float reactionScale = Mathf.Lerp(Mathf.Lerp(1.0f, 0.25f, eta_carriage), 0.40f, chi_up);
+            float tau_hip_inertial_reaction = (1.0f - gReset) * reactionScale * I_couple * ddphi;
 
             float omegaTheta1Sq = (gReset * 850.0f) / s.I_eff;
-            float gammaTheta1   = (cfg.gamma_roll + gReset * 160.0f) / (2.0f * s.I_eff);
-            float fExtTheta1    = (tau_gravity + tau_carriage_com + oncomingPushTorque + tau_leg_carriage_push + tau_hip_inertial_reaction) / s.I_eff;
+            float gammaTheta1   = (kd_leg_roll + SoftMin(cfg.gamma_roll, 10.0f) + gReset * 160.0f) / (2.0f * s.I_eff);
+            float fExtTheta1    = (tau_gravity + tau_carriage_com + tau_leg_lateral_drive + oncomingPushTorque + tau_leg_carriage_push + tau_hip_inertial_reaction) / s.I_eff;
 
             SolveSecondOrderBoundedExact(
                 ref s.theta1, ref s.omega1, out _,
