@@ -658,13 +658,7 @@ namespace SkyTechSimulator
             float tau_gravity = (1.0f - gReset) * mg * s.y_CoM;
             float tau_carriage_com = -(1.0f - gReset) * cfg.M * (ddxCoupling * ddx_c + s.a_c) * s.z_CoM;
 
-            // 低姿勢時（s.l1 が短いとき）でもロール駆動モーメントが低下しないよう基準長 l_eq_safe でスケーリング
             float lowStanceBoost = 1.0f + 0.75f * (1.0f - s.s_rom);
-            float legSupportRatio = AnalyticClamp(s.F_leg / mg, 0.50f, 1.8f);
-            float kp_leg_roll = outwardFreeGate * cfg.comShiftRollDriveGain * cfg.mouseRollMomentGain * mg * l_eq_safe * lowStanceBoost * legSupportRatio;
-            float kd_leg_roll = 0.18f * kp_leg_roll;
-            float tau_leg_lateral_drive = (1.0f - gReset) * kp_leg_roll * delta_theta1_cmd;
-
             float oncomingPushTorque = (1.0f - gReset) * outwardFreeGate * (s.u_shift_filtered * Mathf.Abs(s.v_c) * (0.45f * mg * s.z_CoM) * lowStanceBoost);
 
             float skidRightingPenalty = 1.0f - 0.40f * s.skid_intensity;
@@ -677,8 +671,8 @@ namespace SkyTechSimulator
             float tau_hip_inertial_reaction = (1.0f - gReset) * Mathf.Lerp(1.0f, 0.25f, eta_carriage) * I_couple * ddphi;
 
             float omegaTheta1Sq = (gReset * 850.0f) / s.I_eff;
-            float gammaTheta1   = (kd_leg_roll + SoftMin(cfg.gamma_roll, 10.0f) + gReset * 160.0f) / (2.0f * s.I_eff);
-            float fExtTheta1    = (tau_gravity + tau_carriage_com + tau_leg_lateral_drive + oncomingPushTorque + tau_leg_carriage_push + tau_hip_inertial_reaction) / s.I_eff;
+            float gammaTheta1   = (cfg.gamma_roll + gReset * 160.0f) / (2.0f * s.I_eff);
+            float fExtTheta1    = (tau_gravity + tau_carriage_com + oncomingPushTorque + tau_leg_carriage_push + tau_hip_inertial_reaction) / s.I_eff;
 
             SolveSecondOrderBoundedExact(
                 ref s.theta1, ref s.omega1, out _,
