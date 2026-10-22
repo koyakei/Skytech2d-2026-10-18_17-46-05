@@ -135,10 +135,6 @@ namespace SkyTechSimulator
             return zInf + (z0 - zInf) * decay;
         }
 
-        /// <summary>
-        /// 2階線形微分方程式 d^2q/dt^2 + 2*gamma*dq/dt + omega0Sq*(q - qEq) = fExt の厳密解析解プロパゲータ。
-        /// コリオリ効果により一時的に gamma < 0（負減衰・スピン加速）となる領域も含め、単一の整関数展開で厳密に積分します。
-        /// </summary>
         private static void SolveSecondOrderBoundedExact(
             ref float q,
             ref float v,
@@ -297,7 +293,7 @@ namespace SkyTechSimulator
         }
 
         // =========================================================================
-        // メイン時間発展ステップ（項目4・5・6を現実に即して統合した解析的運動方程式）
+        // メイン時間発展ステップ（谷回り・山回り位相ヒステリシス統合版）
         // =========================================================================
 
         public static void Step(ref SimState s, in SimInput input, SkyTechSimConfig cfg, float dt)
@@ -316,7 +312,6 @@ namespace SkyTechSimulator
             float cosPhi = Mathf.Cos(s.phi);
             float sinPhi = Mathf.Sin(s.phi);
 
-            // 有効ロール慣性モーメント I_eff(l1, phi) とその空間偏微分 (項目4: ラグランジュ連成用)
             s.I_eff = SoftMax(2.0f,
                 m1c1Sq_plus_m2 * s.l1 * s.l1 +
                 cfg.m2 * (cfg.l2 * cfg.l2 + 2.0f * s.l1 * cfg.l2 * cosPhi));
@@ -406,7 +401,7 @@ namespace SkyTechSimulator
             float phi_target = (1.0f - gReset) * AnalyticClamp(rawPhiTarget, minPhiLimit, maxPhiLimit);
 
             // =========================================================================
-            // 2. 下肢伸縮運動方程式 (l1, dl1) — 項目4: ロール回転遠心伸展力 F_rot_cent の連成
+            // 2. 下肢伸縮運動方程式 (l1, dl1)
             // =========================================================================
             EvaluateLegBiomechanics(
                 s.l1, cfg,
@@ -465,7 +460,6 @@ namespace SkyTechSimulator
             float loadBlend = AnalyticClamp01(u_norm + u_flex_eff + (1.0f - phi_support));
             float effectiveLoad = Mathf.Lerp(mg, s.F_compress, loadBlend);
 
-            // ★項目4: ラグランジュ方程式 ∂T/∂l1 = (1/2)*(∂I_eff/∂l1)*omega1^2 による回転遠心伸展力
             float F_rot_centrifugal = half_dI_dl1 * (s.omega1 * s.omega1);
 
             float fExtLeg = (selfWeightSupport + s.u_ext_actual + F_rot_centrifugal - activeTuckPull - effectiveLoad) / cfg.M;
@@ -478,7 +472,6 @@ namespace SkyTechSimulator
                 cfg.l_min, cfg.l_max, safeDt
             );
 
-            // 上方加速度 G_z_up・パワー・スタミナ・床反力の更新
             float v_com_ext = SoftPlus(s.dl1);
             float v_z_ext = v_com_ext * cosAbsTheta1;
             float G_z_kin = (v_z_ext * v_z_ext) / (2.0f * cfg.g * SoftMax(0.12f, dropHold));
@@ -506,7 +499,6 @@ namespace SkyTechSimulator
                      - c_leg_eff * s.dl1 * cosAbsTheta1 + s.u_ext_actual * cosAbsTheta1;
 
             float v_y_ext = v_com_ext * sinAbsTheta1;
-            float a_y_ext = SoftPlus(ddl1) * sinAbsTheta1;
             s.F_lat_step = (s.u_ext_actual + cfg.M * SoftPlus(ddl1)) * sinAbsTheta1
                          + cfg.M * Mathf.Abs(s.a_c) * Mathf.Sin(absPsi);
 
@@ -514,18 +506,31 @@ namespace SkyTechSimulator
             s.F_leg = SoftMax(F_vert_pos, F_vert_pos * cosAbsTheta1 + s.F_lat_step * sinAbsTheta1);
 
             // =========================================================================
-            // 3. 項目5（雪面せん断挫折モデル）＆ 項目6（結合水平質量による台車運動と a_c の分離）
+            // 3. 谷回り・山回り位相ヒステリシス（項目1）を組み込んだ台車運動方程式
             // =========================================================================
+
+            // ★項目1: ロール角 theta1 とロール角速度 omega1（およびシフト指令）から
+            // 「ロール角が増す局面（谷回り: sigma_in > 0）」と「ロール角が減る局面（山回り: sigma_out > 0）」を解析的に分離
+            float effectiveRollRate = s.omega1 + 0.65f * (delta_theta1_cmd / SoftMax(0.04f, tauShift));
+            float rollDirSign = SmoothSign(s.theta1, 4.0f * Mathf.Deg2Rad);
+            float rateDirSign = SmoothSign(effectiveRollRate, 0.22f);
+            float sigma_phase = rollDirSign * rateDirSign; // +1: ロール角増加中(谷回り), -1: ロール角減少中(山回り)
+
+            float sigma_in  = AnalyticClamp01(SoftPlus( sigma_phase)); // 谷回り（ロール増加）度合い [0..1]
+            float sigma_out = AnalyticClamp01(SoftPlus(-sigma_phase)); // 山回り（ロール減少）度合い [0..1]
+
             float playRad = FreePlayDeg * Mathf.Deg2Rad;
             float biteRatio = AnalyticClamp01(absTheta1 / playRad + shiftActivity * 10.0f);
-            s.G_base = G_eq * biteRatio * biteRatio;
+            // 同じロール角でも、谷回り(ロール増加中)は重力が谷側へ逃げるため横Gがマイルドになり、山回り(ロール減少中)は重力が対向して横Gが増す
+            float phaseGMod = 1.0f - 0.25f * sigma_in + 0.30f * sigma_out;
+            s.G_base = G_eq * biteRatio * biteRatio * phaseGMod;
 
             float F_req_ideal = mg * (Mathf.Cos(absPsi) + Mathf.Abs(G_eq) * Mathf.Sin(absPsi));
             float loadRatio = s.F_leg / SoftMax(0.35f * mg, cfg.loadSustainScale * F_req_ideal);
             float maxLambda = Mathf.Lerp(1.0f, SoftMax(1.2f, cfg.lambda_max), AnalyticClamp01((s.P_leg_ext + s.F_lat_step * v_y_ext) / 600.0f));
             s.lambda_sustain = AnalyticClamp(Mathf.Pow(AnalyticClamp(loadRatio, 0.0f, 1.8f), cfg.loadSustainPower_q), 0.0f, maxLambda);
 
-            // ★項目5: モール・クーロン破壊規準に基づく雪面せん断応力比 (静止保持での高G過荷重と動的踏み込みの両方で発動)
+            // 雪面せん断応力比
             float minSkidRad = SoftMax(3.0f, cfg.skidMinAngleDeg) * Mathf.Deg2Rad;
             float refSkidRad = SoftMax(cfg.skidMinAngleDeg + 5.0f, cfg.skidRefAngleDeg) * Mathf.Deg2Rad;
             float angleGate = AnalyticStep(absTheta1, minSkidRad, 0.25f * minSkidRad);
@@ -539,7 +544,6 @@ namespace SkyTechSimulator
             float sigma_impulse = (s.P_step_eff / SoftMax(150.0f, cfg.snowFailurePowerThreshold))
                                 + 0.30f * (s.u_ext_actual / (mg * SoftMax(0.4f, cfg.snowFailureVerticalForceG)));
 
-            // 脚を動かさず耐えている時(sigma_impulse == 0)でも 0.45 * phi_angle * sigma_force^2 により限界超過でスキッドする
             s.snow_stress_ratio = phi_angle * sigma_force * (0.45f * sigma_force + sigma_impulse);
 
             float skidOnset = AnalyticStep(s.snow_stress_ratio, 1.0f, 0.04f);
@@ -548,26 +552,42 @@ namespace SkyTechSimulator
             float skidTau = Mathf.Lerp(recTau, 0.025f, skidOnset);
             s.skid_intensity = SolveFirstOrderExact(s.skid_intensity, targetSkid, skidTau, safeDt);
 
-            // ★項目6: シューア補元による「台車＋スキーヤー結合水平有効質量 m_c_eff」と台車運動方程式
+            // 台車＋スキーヤー結合水平有効質量 m_c_eff
             float m_c_hw = SoftMax(1.0f, cfg.carriageMass);
             float M_coupled_horiz = cfg.M * (1.0f - (cfg.M * s.z_CoM * s.z_CoM) / SoftMax(1.0f, s.I_eff + cfg.M * s.R_CoM * s.R_CoM));
             float m_c_eff = m_c_hw + M_coupled_horiz;
 
             float effectiveAngle = SoftMax(absTheta1, absPsi);
             const float C_rail = 75.0f;
-            float c_glide = Mathf.Lerp(C_rail * 0.35f, C_rail, AnalyticClamp01(effectiveAngle / (20f * Mathf.Deg2Rad)));
+            float c_glide_base = Mathf.Lerp(C_rail * 0.35f, C_rail, AnalyticClamp01(effectiveAngle / (20f * Mathf.Deg2Rad)));
+
+            // ★メカニズムB: エッジグリップ剛性 c_glide の谷回り・山回り非対称化
+            // ロール角を増す時(sigma_in)は捉えをマイルドにし、ロール角が減る時(sigma_out)はエッジが強く噛み込んで台車を走らせる
+            float c_glide = c_glide_base * (1.0f - 0.28f * sigma_in + 0.42f * sigma_out);
 
             float sinRoll = Mathf.Sin(effectiveAngle);
             float angleShapeFactor = Mathf.Lerp(1.0f, 0.40f, AnalyticClamp01((effectiveAngle - 5f * Mathf.Deg2Rad) / (25f * Mathf.Deg2Rad)))
                                    + 0.35f * (sinRoll * sinRoll);
 
-            float rollInAssist = (1.0f - chi_up) * 0.25f * s.dy_cmd;
+            float rollInAssist = (1.0f - chi_up) * 0.20f * s.dy_cmd;
             float rawTanDrive = (s.y_CoM + rollInAssist) / SoftMax(0.18f, s.z_CoM);
             float tanAngleDrive = 1.65f * (float)Math.Tanh(rawTanDrive / 1.65f);
-            s.v_c_target = (tanAngleDrive * cfg.g) * 1.217f * angleShapeFactor;
+            float v_c_sym = (tanAngleDrive * cfg.g) * 1.217f * angleShapeFactor;
+
+            // ★メカニズムA: 目標台車速度 v_c_target のヒステリシスループ（斜面勾配 alphaRad による谷回り減速・山回り加速）
+            // 同じロール角 theta1 でも、ロール角が増す時(sigma_in)は台車速度が抑えられて重心が谷側へ先行し、
+            // ロール角が減る時(sigma_out)は山回りの重力成分とたわみ解放によって台車が高速で重心の下へ走り込む
+            float g_slope = cfg.g * Mathf.Sin(cfg.alphaRad);
+            float phaseSpeedGain = 1.0f - 0.35f * sigma_in + 0.45f * sigma_out;
+            float slopeHysteresisVel = -0.55f * g_slope * rateDirSign * sinAbsTheta1 * cosAbsTheta1;
+            s.v_c_target = v_c_sym * phaseSpeedGain + slopeHysteresisVel;
 
             float carvingRetention = Mathf.Lerp(1.0f, cfg.skidGripMultiplier, s.skid_intensity);
-            float F_drive = C_rail * s.v_c_target * carvingRetention;
+            float F_drive = c_glide * s.v_c_target * carvingRetention;
+
+            // ★メカニズムC: スキー板のたわみ解放（キャンバー・リバウンド推力）
+            // ロール角が減る局面(sigma_out > 0)で、踏み込んでいる脚軸力の水平成分が板の走りとして台車を推進する
+            float F_camber_rebound = sigma_out * 0.40f * s.F_leg * sin1 * carvingRetention;
 
             float M_inertia = s.I_eff / SoftMax(0.15f, s.R_CoM * s.R_CoM);
             float inertiaMassRatio = M_inertia / (m_c_hw + M_inertia);
@@ -577,7 +597,6 @@ namespace SkyTechSimulator
             float dynamicFootForce = ((s.P_leg_ext / SoftMax(0.3f, v_max_eff)) + 0.35f * F_lat_cent_demand) * sinAbsTheta1;
             s.skid_pushback_force = -dirSign * cfg.carriagePushbackGain * inertiaMassRatio * dynamicFootForce * s.skid_intensity;
 
-            // 脚伸展の水平分力が台車をターン内側（重心の下）へ押し込む実反力 + 過渡シフト反作用
             float activeExtCarriageDrive = -s.u_ext_actual * sin1 * (1.0f - s.skid_intensity) * 0.45f;
             float transientShiftImpulse = -cfg.M * maxShiftDesign * du_shift_rate * 0.20f * (1.0f - chi_up) * inertiaMassRatio;
 
@@ -585,7 +604,7 @@ namespace SkyTechSimulator
             float v_c_prev = s.v_c;
             float omegaRailSq = cfg.k_center;
             float gammaRail = c_glide / (2.0f * m_c_eff);
-            float fExtRail = (F_drive + activeExtCarriageDrive + s.skid_pushback_force + transientShiftImpulse) / m_c_eff;
+            float fExtRail = (F_drive + F_camber_rebound + activeExtCarriageDrive + s.skid_pushback_force + transientShiftImpulse) / m_c_eff;
 
             SolveSecondOrderBoundedExact(
                 ref s.x_c, ref s.v_c, out _,
@@ -598,7 +617,6 @@ namespace SkyTechSimulator
             float bounceGate = atRailEndGate * pushingOutwardGate;
             s.v_c = Mathf.Lerp(s.v_c, -0.30f * v_c_prev, bounceGate);
 
-            // 台車の実水平加速度 ddx_c（結合有効質量 m_c_eff で解かれているため物理スケールが厳密に一致）
             float ddx_c = (s.v_c - v_c_prev) / safeDt;
 
             float outsideSameSide = AnalyticStep(s.x_c * s.y_CoM, 0.0f, 2e-3f);
@@ -616,7 +634,6 @@ namespace SkyTechSimulator
             float viableGate = hipViableGate * bootViableGate;
             float gripFactor = viableGate * weightGate * skidGripGate;
 
-            // 定常滑走成分 eta_carriage に比例するカービング遠心加速度 a_c（過渡期の ddx_c と相補的で二重計上しない）
             float a_c_target = (s.G_base * cfg.g) * s.lambda_sustain * gripFactor * eta_carriage;
             float tauG = AnalyticClamp(cfg.tau_G_lag, 0.005f, 0.015f);
             s.a_c = viableGate * SolveFirstOrderExact(s.a_c, a_c_target, tauG, safeDt);
@@ -625,17 +642,15 @@ namespace SkyTechSimulator
             s.kappa = s.a_c / vSqSafe;
             s.kappa_target = a_c_target / vSqSafe;
 
-            // ★項目6: ブーツ支点に作用するトータル非慣性系水平加速度 a_pivot_total = ddx_c + a_c (恣意的な 0.35f 係数を廃止)
             float a_pivot_total = ddx_c + s.a_c;
 
             // =========================================================================
-            // 4. 2リンク回転運動方程式 (phi, dphi) と (theta1, omega1) — 項目4: コリオリ連成
+            // 4. 2リンク回転運動方程式 (phi, dphi) と (theta1, omega1)
             // =========================================================================
 
             // --- A. 股関節相対角 phi(t) の2階線形運動方程式 ---
             float theta2_cur = s.theta1 - s.phi;
             float theta2_target = s.theta1 - phi_target;
-            // 上体に働く重力＋トータル非慣性系加速度 a_pivot_total による負荷トルク
             float tau_hip_load = m2_l2 * (cfg.g * Mathf.Sin(theta2_cur) - a_pivot_total * Mathf.Cos(theta2_cur));
             float tau_hip_ff   = (1.0f - gReset) * m2_l2 * (cfg.g * Mathf.Sin(theta2_target) - s.a_c * (1.0f - 0.85f * forceOverride) * Mathf.Cos(theta2_target));
 
@@ -646,7 +661,6 @@ namespace SkyTechSimulator
             float rawHipSteer = tau_hip_ff + kp_hip_eff * (phi_target - s.phi) - kd_hip_eff * s.dphi;
             s.tau_hip_steer = steerScale * AnalyticClamp(rawHipSteer, -tau_hip_avail, tau_hip_avail);
 
-            // 項目4: 脚伸縮 dl1 とロール回転 omega1 から股関節へ作用するコリオリ・遠心連成トルク
             float tau_hip_coriolis = -m2_l2 * (2.0f * s.dl1 * s.omega1 * cosPhi + s.l1 * s.omega1 * s.omega1 * sinPhi);
 
             float omegaPhiSq = (gReset * 900.0f) / I2_hip;
@@ -660,8 +674,10 @@ namespace SkyTechSimulator
             );
 
             // --- B. 下部リンク角 theta1(t) の2階線形運動方程式 ---
-            float tau_gravity = (1.0f - gReset) * mg * s.y_CoM;
-            // ★項目6: 重心に作用する非慣性系慣性モーメント（台車実加速度 ddx_c + 遠心加速度 a_c が 1:1 で作用）
+            // ★項目1: 谷回り(sigma_in > 0)では斜面の重力が谷側への倒れ込みを助け、
+            // 山回り(sigma_out > 0)ではたわみ反発が起き上がりを助ける
+            float valleyGravityAssist = 1.0f + 0.25f * sigma_in * Mathf.Sin(cfg.alphaRad);
+            float tau_gravity = (1.0f - gReset) * mg * s.y_CoM * valleyGravityAssist;
             float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total * s.z_CoM;
 
             float lowStanceBoost = 1.0f + 0.75f * (1.0f - s.s_rom);
@@ -669,7 +685,6 @@ namespace SkyTechSimulator
             float kp_leg_roll = outwardFreeGate * cfg.comShiftRollDriveGain * cfg.mouseRollMomentGain * mg * l_eq_safe * lowStanceBoost * legSupportRatio;
             float kd_leg_roll = 0.18f * kp_leg_roll;
 
-            // 「倒れ込み＝腰先行」と「起き上がり＝頭先行・腰追従」の駆動モーメント融合
             float headLeadDisplacement = effectiveAngRatio * s.theta1 - s.phi;
             float headLeadActual = shiftDir * SoftPlus(shiftDir * headLeadDisplacement);
             float headPullDrive  = 0.15f * delta_theta1_cmd + cfg.headDiveRollDriveGain * headLeadActual;
@@ -677,13 +692,10 @@ namespace SkyTechSimulator
 
             float tau_leg_lateral_drive = (1.0f - gReset) * kp_leg_roll * effectiveLegDriveCmd;
 
-            // 2リンク系の慣性連成反作用 (角運動量保存)
             float I_couple = I2_hip + m2_l2 * s.l1 * cosPhi;
             float reactionScale = Mathf.Lerp(Mathf.Lerp(1.0f, 0.25f, eta_carriage), 0.40f, chi_up);
             float tau_hip_inertial_reaction = (1.0f - gReset) * reactionScale * I_couple * ddphi;
 
-            // ★項目4: 有効慣性モーメントの時間微分 dI_eff/dt = (∂I_eff/∂l1)*dl1 + (∂I_eff/∂phi)*dphi による
-            // コリオリ角運動量保存項（縮むと dI_eff_dt < 0 となってロール回転が加速、伸びると dI_eff_dt > 0 で回転減速）
             float dI_eff_dt = 2.0f * half_dI_dl1 * s.dl1 + dI_dphi * s.dphi;
 
             float omegaTheta1Sq = (gReset * 850.0f) / s.I_eff;
@@ -708,9 +720,11 @@ namespace SkyTechSimulator
             s.dy_actual = s.y_CoM - (L1 * Mathf.Sin(s.theta1 - delta_theta1_cmd) + L2 * Mathf.Sin(s.theta2_ref));
 
             // =========================================================================
-            // 5. 進行方向速度 V(t) のリッカチ微分方程式の解析解
+            // 5. 進行方向速度 V(t) のリッカチ微分方程式の解析解（谷回り加速・山回り減速も連動）
             // =========================================================================
-            float gravityDrive = cfg.g * Mathf.Sin(cfg.alphaRad) * 0.35f;
+            // 谷回り(sigma_in > 0)ではフォールラインへ向かうため進行方向重力が強まり、山回り(sigma_out > 0)では斜面を横切るため減速する
+            float yawCosineApprox = 1.0f + 0.35f * sigma_in - 0.30f * sigma_out;
+            float gravityDrive = cfg.g * Mathf.Sin(cfg.alphaRad) * 0.35f * yawCosineApprox;
             float frictionMult = 1.0f + 2.0f * s.skid_intensity;
             float snowFriction = cfg.mu_snow * frictionMult * (SoftPlus(s.F_leg) / cfg.M);
             float dragCoeffPerMass = Mathf.Lerp(0.0022f, 0.0036f, s.s_rom);
