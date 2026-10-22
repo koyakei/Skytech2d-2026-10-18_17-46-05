@@ -100,7 +100,7 @@ namespace SkyTechSimulator
         private static float BoolGate(bool b) => Convert.ToSingle(b);
 
         private static float SmoothSign(float x, float eps = 1e-3f) =>
-            (float)Math.Tanh(x / eps);
+            (float)Math.Tanh(x / SoftMax(1e-6f, eps));
 
         private static float SoftPlus(float x, float eps = 1e-5f) =>
             0.5f * (x + Mathf.Sqrt(x * x + eps * eps));
@@ -293,7 +293,7 @@ namespace SkyTechSimulator
         }
 
         // =========================================================================
-        // メイン時間発展ステップ（谷回り・山回り位相ヒステリシス統合版）
+        // メイン時間発展ステップ（項目1・2・4・5・6 統合解析解ソルバー）
         // =========================================================================
 
         public static void Step(ref SimState s, in SimInput input, SkyTechSimConfig cfg, float dt)
@@ -506,26 +506,54 @@ namespace SkyTechSimulator
             s.F_leg = SoftMax(F_vert_pos, F_vert_pos * cosAbsTheta1 + s.F_lat_step * sinAbsTheta1);
 
             // =========================================================================
-            // 3. 谷回り・山回り位相ヒステリシス（項目1）を組み込んだ台車運動方程式
+            // 3. 項目2（Modified Howe カービング方程式・サイドカット半径 R_sc・速度 V^2）＆ 項目1（位相ヒステリシス）
             // =========================================================================
 
-            // ★項目1: ロール角 theta1 とロール角速度 omega1（およびシフト指令）から
-            // 「ロール角が増す局面（谷回り: sigma_in > 0）」と「ロール角が減る局面（山回り: sigma_out > 0）」を解析的に分離
+            // 谷回り（ロール増加: sigma_in > 0）と 山回り（ロール減少: sigma_out > 0）の解析的位相分離
             float effectiveRollRate = s.omega1 + 0.65f * (delta_theta1_cmd / SoftMax(0.04f, tauShift));
             float rollDirSign = SmoothSign(s.theta1, 4.0f * Mathf.Deg2Rad);
             float rateDirSign = SmoothSign(effectiveRollRate, 0.22f);
-            float sigma_phase = rollDirSign * rateDirSign; // +1: ロール角増加中(谷回り), -1: ロール角減少中(山回り)
+            float sigma_phase = rollDirSign * rateDirSign;
 
-            float sigma_in  = AnalyticClamp01(SoftPlus( sigma_phase)); // 谷回り（ロール増加）度合い [0..1]
-            float sigma_out = AnalyticClamp01(SoftPlus(-sigma_phase)); // 山回り（ロール減少）度合い [0..1]
+            float sigma_in  = AnalyticClamp01(SoftPlus( sigma_phase));
+            float sigma_out = AnalyticClamp01(SoftPlus(-sigma_phase));
 
-            float playRad = FreePlayDeg * Mathf.Deg2Rad;
+            // ★項目2: 滑走速度 V、基準速度 V_ref、サイドカット半径 R_sc、Modified Howe 曲線に基づく基準横Gの導出
+            float vRefSafe = SoftMax(4.0f, cfg.V_ref);
+            float rScSafe  = SoftMax(3.0f, cfg.R_sc);
+            float speedRatio = s.V / vRefSafe;
+            float speedSqFactor = speedRatio * speedRatio;
+
+            // サイドカット幾何学スケール V_ref^2 / (g * R_sc) と設定値 G0_curve の整合スケーリング
+            float sidecutRefG = (vRefSafe * vRefSafe) / (cfg.g * rScSafe);
+            float G0_effective = 0.5f * (cfg.G0_curve + 2.45f * sidecutRefG);
+
+            // Modified Howe たわみ曲線: sin^p(|theta1|) / cos(k_flex * |theta1|)
+            float deadRad = SoftMax(0.5f * Mathf.Deg2Rad, cfg.theta_deadRad);
+            float edgeSignSmooth = SmoothSign(s.theta1, deadRad);
+            float sinPowP = Mathf.Pow(SoftMax(1e-4f, sinAbsTheta1), SoftMax(0.5f, cfg.sinPower_p));
+            float cosFlex = SoftMax(0.15f, Mathf.Cos(cfg.k_flex * absTheta1));
+            float howeCurve = edgeSignSmooth * (sinPowP / cosFlex);
+
+            // 外向傾（くの字姿勢: theta1 * phi > 0）による有効エッジ食い込み・たわみ増幅 (k_ang_boost)
+            float angulationAlignment = SoftPlus(edgeSignSmooth * (s.phi / phiMax));
+            float angulationBoost = 1.0f + cfg.k_ang_boost * angulationAlignment;
+
+            // エッジ角・サイドカット・速度 V^2 から決まる純粋なカービング横G (G_howe)
+            float G_howe = G0_effective * angulationBoost * howeCurve * speedSqFactor;
+
+            // 重心傾き G_eq による板の自己整合たわみ成分にも速度二乗比 (V / V_ref)^2 を反映
+            float G_com_speed = G_eq * speedSqFactor;
+
+            float playRad = SoftMax(0.5f * Mathf.Deg2Rad, cfg.carriageDeadzoneRad);
             float biteRatio = AnalyticClamp01(absTheta1 / playRad + shiftActivity * 10.0f);
-            // 同じロール角でも、谷回り(ロール増加中)は重力が谷側へ逃げるため横Gがマイルドになり、山回り(ロール減少中)は重力が対向して横Gが増す
             float phaseGMod = 1.0f - 0.25f * sigma_in + 0.30f * sigma_out;
-            s.G_base = G_eq * biteRatio * biteRatio * phaseGMod;
 
-            float F_req_ideal = mg * (Mathf.Cos(absPsi) + Mathf.Abs(G_eq) * Mathf.Sin(absPsi));
+            // 板の幾何学的カービング横G (72%) と 重心荷重たわみ横G (28%) の結合
+            s.G_base = (0.72f * G_howe + 0.28f * G_com_speed) * (biteRatio * biteRatio) * phaseGMod;
+
+            // 要求軸方向荷重も実際のカービング横G |G_base| に対して計算される
+            float F_req_ideal = mg * (Mathf.Cos(absPsi) + Mathf.Abs(s.G_base) * Mathf.Sin(absPsi));
             float loadRatio = s.F_leg / SoftMax(0.35f * mg, cfg.loadSustainScale * F_req_ideal);
             float maxLambda = Mathf.Lerp(1.0f, SoftMax(1.2f, cfg.lambda_max), AnalyticClamp01((s.P_leg_ext + s.F_lat_step * v_y_ext) / 600.0f));
             s.lambda_sustain = AnalyticClamp(Mathf.Pow(AnalyticClamp(loadRatio, 0.0f, 1.8f), cfg.loadSustainPower_q), 0.0f, maxLambda);
@@ -560,23 +588,21 @@ namespace SkyTechSimulator
             float effectiveAngle = SoftMax(absTheta1, absPsi);
             const float C_rail = 75.0f;
             float c_glide_base = Mathf.Lerp(C_rail * 0.35f, C_rail, AnalyticClamp01(effectiveAngle / (20f * Mathf.Deg2Rad)));
-
-            // ★メカニズムB: エッジグリップ剛性 c_glide の谷回り・山回り非対称化
-            // ロール角を増す時(sigma_in)は捉えをマイルドにし、ロール角が減る時(sigma_out)はエッジが強く噛み込んで台車を走らせる
             float c_glide = c_glide_base * (1.0f - 0.28f * sigma_in + 0.42f * sigma_out);
 
             float sinRoll = Mathf.Sin(effectiveAngle);
             float angleShapeFactor = Mathf.Lerp(1.0f, 0.40f, AnalyticClamp01((effectiveAngle - 5f * Mathf.Deg2Rad) / (25f * Mathf.Deg2Rad)))
                                    + 0.35f * (sinRoll * sinRoll);
 
+            // ★項目2: 台車の目標速度 v_c_target にもサイドカット曲率 (G_howe) と滑走速度比 (V / V_ref) を反映
             float rollInAssist = (1.0f - chi_up) * 0.20f * s.dy_cmd;
-            float rawTanDrive = (s.y_CoM + rollInAssist) / SoftMax(0.18f, s.z_CoM);
+            float comTanDrive = (s.y_CoM + rollInAssist) / SoftMax(0.18f, s.z_CoM);
+            float howeTanDrive = 0.55f * howeCurve * angulationBoost * (15.0f / rScSafe);
+            float rawTanDrive = (0.55f * comTanDrive + 0.45f * howeTanDrive) * SoftBoxSpeedScale(speedRatio);
             float tanAngleDrive = 1.65f * (float)Math.Tanh(rawTanDrive / 1.65f);
-            float v_c_sym = (tanAngleDrive * cfg.g) * 1.217f * angleShapeFactor;
+            float railScaleNorm = SoftMax(0.5f, cfg.railScale / 4.87f);
+            float v_c_sym = (tanAngleDrive * cfg.g) * 1.217f * railScaleNorm * angleShapeFactor;
 
-            // ★メカニズムA: 目標台車速度 v_c_target のヒステリシスループ（斜面勾配 alphaRad による谷回り減速・山回り加速）
-            // 同じロール角 theta1 でも、ロール角が増す時(sigma_in)は台車速度が抑えられて重心が谷側へ先行し、
-            // ロール角が減る時(sigma_out)は山回りの重力成分とたわみ解放によって台車が高速で重心の下へ走り込む
             float g_slope = cfg.g * Mathf.Sin(cfg.alphaRad);
             float phaseSpeedGain = 1.0f - 0.35f * sigma_in + 0.45f * sigma_out;
             float slopeHysteresisVel = -0.55f * g_slope * rateDirSign * sinAbsTheta1 * cosAbsTheta1;
@@ -585,9 +611,7 @@ namespace SkyTechSimulator
             float carvingRetention = Mathf.Lerp(1.0f, cfg.skidGripMultiplier, s.skid_intensity);
             float F_drive = c_glide * s.v_c_target * carvingRetention;
 
-            // ★メカニズムC: スキー板のたわみ解放（キャンバー・リバウンド推力）
-            // ロール角が減る局面(sigma_out > 0)で、踏み込んでいる脚軸力の水平成分が板の走りとして台車を推進する
-            float F_camber_rebound = sigma_out * 0.40f * s.F_leg * sin1 * carvingRetention;
+            float F_camber_rebound = sigma_out * 0.40f * s.F_leg * sin1 * carvingRetention * SoftBoxSpeedScale(speedRatio);
 
             float M_inertia = s.I_eff / SoftMax(0.15f, s.R_CoM * s.R_CoM);
             float inertiaMassRatio = M_inertia / (m_c_hw + M_inertia);
@@ -674,11 +698,13 @@ namespace SkyTechSimulator
             );
 
             // --- B. 下部リンク角 theta1(t) の2階線形運動方程式 ---
-            // ★項目1: 谷回り(sigma_in > 0)では斜面の重力が谷側への倒れ込みを助け、
-            // 山回り(sigma_out > 0)ではたわみ反発が起き上がりを助ける
             float valleyGravityAssist = 1.0f + 0.25f * sigma_in * Mathf.Sin(cfg.alphaRad);
             float tau_gravity = (1.0f - gReset) * mg * s.y_CoM * valleyGravityAssist;
-            float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total * s.z_CoM;
+
+            // ★項目2: ブーツカフ剛性 beta_cuff による高バンク時の遠心復原モーメントアーム維持
+            // 深バンク時に z_CoM が低くても、ブーツカフ剛性によって R_CoM 相当のモーメントアームが維持される
+            float z_CoM_cuff = Mathf.Lerp(s.z_CoM, s.R_CoM, AnalyticClamp01(cfg.beta_cuff) * sinAbsTheta1 * sinAbsTheta1);
+            float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total * z_CoM_cuff;
 
             float lowStanceBoost = 1.0f + 0.75f * (1.0f - s.s_rom);
             float legSupportRatio = AnalyticClamp(s.F_leg / mg, 0.50f, 1.8f);
@@ -698,8 +724,11 @@ namespace SkyTechSimulator
 
             float dI_eff_dt = 2.0f * half_dI_dl1 * s.dl1 + dI_dphi * s.dphi;
 
+            // 高速ロール時の二乗抗力減衰 gamma_quad も線形化減衰係数へ解析的に統合
+            float quadDamping = cfg.gamma_quad * 0.15f * Mathf.Abs(s.omega1);
+
             float omegaTheta1Sq = (gReset * 850.0f) / s.I_eff;
-            float gammaTheta1   = (kd_leg_roll + SoftMin(cfg.gamma_roll, 10.0f) + dI_eff_dt + gReset * 160.0f) / (2.0f * s.I_eff);
+            float gammaTheta1   = (kd_leg_roll + SoftMin(cfg.gamma_roll, 10.0f) + quadDamping + dI_eff_dt + gReset * 160.0f) / (2.0f * s.I_eff);
             float fExtTheta1    = (tau_gravity + tau_inertial_com + tau_leg_lateral_drive + tau_hip_inertial_reaction) / s.I_eff;
 
             SolveSecondOrderBoundedExact(
@@ -720,13 +749,14 @@ namespace SkyTechSimulator
             s.dy_actual = s.y_CoM - (L1 * Mathf.Sin(s.theta1 - delta_theta1_cmd) + L2 * Mathf.Sin(s.theta2_ref));
 
             // =========================================================================
-            // 5. 進行方向速度 V(t) のリッカチ微分方程式の解析解（谷回り加速・山回り減速も連動）
+            // 5. 進行方向速度 V(t) のリッカチ微分方程式の解析解
             // =========================================================================
-            // 谷回り(sigma_in > 0)ではフォールラインへ向かうため進行方向重力が強まり、山回り(sigma_out > 0)では斜面を横切るため減速する
             float yawCosineApprox = 1.0f + 0.35f * sigma_in - 0.30f * sigma_out;
             float gravityDrive = cfg.g * Mathf.Sin(cfg.alphaRad) * 0.35f * yawCosineApprox;
             float frictionMult = 1.0f + 2.0f * s.skid_intensity;
-            float snowFriction = cfg.mu_snow * frictionMult * (SoftPlus(s.F_leg) / cfg.M);
+            // 深バンクでのエッジング抵抗（板を深くたわませるほど進行方向の雪面抵抗もわずかに増える現実の特性）
+            float carvingInducedDrag = 0.012f * sinAbsTheta1 * sinAbsTheta1 * Mathf.Abs(s.G_base) * cfg.g;
+            float snowFriction = cfg.mu_snow * frictionMult * (SoftPlus(s.F_leg) / cfg.M) + carvingInducedDrag;
             float dragCoeffPerMass = Mathf.Lerp(0.0022f, 0.0036f, s.s_rom);
             float pumpPropulsion = (0.045f * s.P_leg_ext) / (cfg.M * SoftMax(2.0f, s.V));
             float aNetDrive = gravityDrive - snowFriction + pumpPropulsion;
@@ -737,6 +767,12 @@ namespace SkyTechSimulator
             // 6. テレメトリ表示用ラベルへのマッピング
             // =========================================================================
             s.gripState = EvaluateGripStateLabel(in s, cfg, halfRail, N_min);
+        }
+
+        /// <summary>台車目標速度に対する滑走速度比 V / V_ref の滑らかなスケーリング関数</summary>
+        private static float SoftBoxSpeedScale(float speedRatio)
+        {
+            return 0.55f + 0.45f * AnalyticClamp(speedRatio, 0.50f, 1.65f);
         }
 
         private static SkiGripState EvaluateGripStateLabel(in SimState s, SkyTechSimConfig cfg, float halfRail, float N_min)
