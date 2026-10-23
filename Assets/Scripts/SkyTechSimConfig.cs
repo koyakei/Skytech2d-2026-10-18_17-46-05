@@ -7,11 +7,8 @@ namespace SkyTechSimulator
     {
         [Header("1. Environment & Hardware Constants")]
         public float g = 9.81f;
-        public float carriageMass = 6.5f;
         public float W_rail = 17.20f;
         public float railScale = 5.20f;
-        public float k_center = 0.15f;
-        public float c_center = 4.0f;
         public float R_sc = 12.5f;
         public float alphaDeg = 12.0f;
         public float mu_snow = 0.04f;
@@ -127,8 +124,6 @@ namespace SkyTechSimulator
 
         [Header("9. Shallow-Angle Capture-Point & Camber Physics")]
         [Range(0.0f, 2.5f)] public float capturePointLeadGain = 0.60f;
-        [Range(0.35f, 1.0f)] public float shallowGlideStiffnessMinRatio = 0.80f;
-        [Range(0.0f, 1.0f)] public float directCarveRightingFloor = 0.75f;
 
         [Header("10. Neuromuscular Co-contraction & Adaptive Damping")]
         [Range(0.2f, 5.0f)] public float adaptiveDampingBoost = 1.8f;
