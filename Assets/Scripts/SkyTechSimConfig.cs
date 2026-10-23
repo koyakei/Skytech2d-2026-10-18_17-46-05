@@ -17,7 +17,7 @@ namespace SkyTechSimulator
         public float carriageMass = 6.5f;
 
         [Tooltip("SkyTechSportキャリッジ有効レール幅 (m) [-W_rail/2, +W_rail/2: 7.20m]")]
-        public float W_rail = 7.20f;
+        public float W_rail = 17.20f;
 
         [Tooltip("仮想横加速度 a_c からキャリッジ実移動速度へのスケーリング係数")]
         public float railScale = 5.20f;
@@ -272,6 +272,12 @@ namespace SkyTechSimulator
         [Tooltip("深角ターン中にマウスが外側にあるとき、上体を鉛直よりさらに外側へ側屈させる比率")]
         [Range(0.0f, 0.60f)]
         public float trunkLeanOutRatio = 0.30f;
+
+        [Tooltip("台車-重心直線上のマウス射影距離がこの値(m)以下のとき、上体を鉛直まで立てる（最大側屈）")]
+        public float comLineNearDist = 0.55f;
+
+        [Tooltip("台車-重心直線上のマウス射影距離がこの値(m)以上のとき、側屈を0にして体をストレートにする")]
+        public float comLineFarDist = 1.45f;
 
         [Tooltip("旧互換用（逆位相導入ゲイン：頂点誘導モデルでは0で無効化し逆振りを防止）")]
         [Range(0.0f, 0.80f)]

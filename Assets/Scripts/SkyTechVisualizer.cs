@@ -231,7 +231,7 @@ public class SkyTechVisualizer : MonoBehaviour
         float depth = -cam.transform.position.z;
         Vector3 centerScreen = new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, depth);
         Vector3 centerWorld3 = cam.ScreenToWorldPoint(centerScreen);
-        Vector2 centerWorld = new Vector2(centerWorld3.x, centerWorld3.y);
+        Vector2 centerWorld = new Vector2(centerWorld3.x, centerWorld3.y + _controller.MouseCenterOffsetY);
 
         float orthoH = cam.orthographic ? cam.orthographicSize : 2.2f;
         float aspect = (cam.pixelWidth > 0 && cam.pixelHeight > 0) ? (float)cam.pixelWidth / cam.pixelHeight : (16f / 9f);
@@ -510,20 +510,14 @@ public class SkyTechVisualizer : MonoBehaviour
             return;
         }
 
-        float depth = -cam.transform.position.z;
-        Vector3 centerScreen = new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, depth);
-        Vector3 centerWorld3 = cam.ScreenToWorldPoint(centerScreen);
-        float dx = mouseWorld.x - centerWorld3.x;
+        // 現在の目標上体角(state.theta2_ref)に基づく目標頭頂位置を算出
+        float sinTheta1 = Mathf.Sin(state.theta1);
+        float cosTheta1 = Mathf.Cos(state.theta1);
+        Vector3 hipPos = footPos + new Vector3(state.l1 * sinTheta1, state.l1 * cosTheta1, 0f);
 
-        // 足元(キャリッジ位置)を基準に、現在のマウス操作が誘導している目標頭頂位置を算出
         float headReach = cfg.l2 * 1.55f;
-        float targetL1 = (input.l1_target > 0.05f) ? input.l1_target : state.l1;
-        float totalReach = targetL1 + headReach;
-
-        float maxLateralReach = Mathf.Clamp(dx, -totalReach * 0.85f, totalReach * 0.85f);
-        float targetApexX = footPos.x + maxLateralReach;
-        float targetApexY = Mathf.Sqrt(Mathf.Max(0.04f, totalReach * totalReach - maxLateralReach * maxLateralReach));
-        Vector3 apexTargetPos = new Vector3(targetApexX, targetApexY, 0f);
+        Vector3 targetTrunkDir = new Vector3(Mathf.Sin(state.theta2_ref), Mathf.Cos(state.theta2_ref), 0f);
+        Vector3 apexTargetPos = hipPos + targetTrunkDir * headReach;
 
         SetCirclePositions(_apexTargetCircle, apexTargetPos, 0.052f, 18);
 
@@ -654,8 +648,15 @@ public class SkyTechVisualizer : MonoBehaviour
     {
         if (!ShowCenterCrosshair) return;
 
+        Camera cam = Camera.main;
         float cx = Screen.width * 0.5f;
         float cy = Screen.height * 0.5f;
+        if (cam != null && _controller != null)
+        {
+            Vector3 wp = cam.ScreenToWorldPoint(new Vector3(cx, cy, -cam.transform.position.z));
+            wp.y += _controller.MouseCenterOffsetY;
+            cy = Screen.height - cam.WorldToScreenPoint(wp).y;
+        }
 
         GUI.Label(new Rect(cx + 10f, cy - 18f, 230f, 18f), "CENTER (側屈伸展・上体直立 / 基準高)", _centerTagStyle);
         GUI.Label(new Rect(cx - 140f, cy + 4f, 130f, 18f), "← 左へ頭頂誘導・側屈", _centerTagStyle);
