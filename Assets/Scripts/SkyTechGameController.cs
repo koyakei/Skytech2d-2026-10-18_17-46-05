@@ -67,7 +67,6 @@ public class SkyTechGameController : MonoBehaviour
     private float _crashFrozenTimer = 0f;
     private float _timeSinceLastSwitch = 0f;
     private float _lastEdgeSign = 0f;
-    private bool _turnInvalidatedByRail = false;
     private float _skidDurationInTurn = 0f;
     private bool _isSteerNeutralActive = false;
 
@@ -121,6 +120,14 @@ public class SkyTechGameController : MonoBehaviour
         }
 
         SkyTechPhysicsSolver.Step(ref _state, in _input, Config, Time.fixedDeltaTime);
+
+        if (_state.gripState == SkiGripState.RailLimitHit)
+        {
+            ComboCount = 0;
+            LastTurnEvaluation = "RAIL HIT! RESET";
+            ResetSimulation();
+            return;
+        }
 
         if (_state.gripState == SkiGripState.HipCrash || _state.gripState == SkiGripState.BootOut)
         {
@@ -299,7 +306,6 @@ public class SkyTechGameController : MonoBehaviour
             float absDx = Mathf.Abs(mouseWorld.x - screenCenterWorld.x);
             if (_hasPrevMouseSample)
             {
-                // 外側から中央へ向かう移動速度 (-d|dx|/dt > 0)
                 float inwardSpeed = Mathf.Max(0f, (_prevAbsDx - absDx) / safeDt);
                 float turnBankGate = Mathf.Clamp01((Mathf.Abs(_state.theta1) * Mathf.Rad2Deg - 8.0f) / 14.0f);
                 float returnTarget = Mathf.Clamp01((inwardSpeed / 1.6f) * Config.centerReturnPushGain) * turnBankGate;
@@ -352,7 +358,6 @@ public class SkyTechGameController : MonoBehaviour
         }
         else if (hasMouseWorld && Config != null)
         {
-            // screenCenterWorld.y に MouseCenterOffsetY を加算して基準位置を高くする
             float baseCenterY = screenCenterWorld.y + MouseCenterOffsetY;
             float dy = mouseWorld.y - baseCenterY;
             float neutralL1 = Mathf.Clamp(Config.l_max - Config.supportDropFromMaxMeters, Config.l_min, Config.l_max);
@@ -370,7 +375,6 @@ public class SkyTechGameController : MonoBehaviour
                     Mathf.Lerp(Config.l_max, Config.l_min, Mathf.InverseLerp(MouseFullExtendDist, MouseFullFlexDist, Vector2.Distance(mouseWorld, new Vector2(screenCenterWorld.x, baseCenterY))))
             };
 
-            // 外側に移動したマウスを中央へ戻す際、側屈の伸展に合わせて目標脚長も伸展方向(l_max)へブースト
             float targetL1 = Mathf.Lerp(baseTargetL1, Config.l_max, _centerReturnPushBoost * 0.85f);
             _input.l1_target = targetL1;
 
@@ -382,13 +386,11 @@ public class SkyTechGameController : MonoBehaviour
             float bottomBoost = Mathf.SmoothStep(0f, 1f, ((Config.l_min + 0.03f) - targetL1) / 0.025f)
                               * Mathf.Clamp01((_state.l1 - targetL1) / 0.03f);
 
-            // 中央戻し操作による脚伸展プッシュ(_centerReturnPushBoost)を合算
             float extTarget  = Mathf.Max(Mathf.Max(0f, smoothDrive), Mathf.Max(topBoost, _centerReturnPushBoost));
             float flexTarget = Mathf.Max(Mathf.Max(0f, -smoothDrive), bottomBoost) * (1.0f - _centerReturnPushBoost);
 
             _input.u_ext_norm  = Mathf.MoveTowards(_input.u_ext_norm,  extTarget,  35.0f * Time.deltaTime);
             _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, flexTarget, 24.0f * Time.deltaTime);
-            // ※マウスを延長線上の高い位置(遠方)へ動かした際に _lockedHipDeg がリセットされないよう自動戻しを削除
         }
         else
         {
@@ -397,7 +399,7 @@ public class SkyTechGameController : MonoBehaviour
             _input.u_flex_norm = 0f;
         }
 
-        // --- 2. 左右の頂点誘導入力（浅角では頭頂を同方向へ誘導、深角では側屈量を制御し中央戻しで上体伸展） ---
+        // --- 2. 左右の頂点誘導入力 ---
         float steer = 0f;
         bool kbLeft = IsKeyHeld(KeyCode.A, KeyCodeToKey(KeyCode.A)) || IsKeyHeld(KeyCode.LeftArrow, KeyCodeToKey(KeyCode.LeftArrow));
         bool kbRight = IsKeyHeld(KeyCode.D, KeyCodeToKey(KeyCode.D)) || IsKeyHeld(KeyCode.RightArrow, KeyCodeToKey(KeyCode.RightArrow));
@@ -416,7 +418,6 @@ public class SkyTechGameController : MonoBehaviour
             {
                 float fullRange = (Config != null) ? Mathf.Max(0.15f, Config.mouseSteerFullRange) : 1.05f;
                 float normSteer = Mathf.Clamp01((absDx - MouseLineDeadzone) / fullRange);
-                // 浅い角度での細やかな頭頂誘導と大きな移動での強い側屈を両立するスムーズな特性
                 steer = Mathf.Sign(dx) * Mathf.Lerp(normSteer, normSteer * normSteer, 0.25f);
             }
         }
@@ -632,11 +633,6 @@ public class SkyTechGameController : MonoBehaviour
         CurrentTurnPeakEdgeDeg = Mathf.Max(CurrentTurnPeakEdgeDeg, currentEdgeDeg);
         CurrentTurnPeakCoMDeg = Mathf.Max(CurrentTurnPeakCoMDeg, currentCoMDeg);
 
-        if (_state.gripState == SkiGripState.RailLimitHit)
-        {
-            _turnInvalidatedByRail = true;
-        }
-
         if (_state.gripState == SkiGripState.Skidding)
         {
             _skidDurationInTurn += Time.fixedDeltaTime;
@@ -669,44 +665,35 @@ public class SkyTechGameController : MonoBehaviour
 
     private void EvaluateCompletedTurn()
     {
-        if (!_turnInvalidatedByRail)
+        TurnCount++;
+        ComboCount++;
+
+        float baseScore = CurrentTurnPeakEdgeDeg;
+        bool hasAngulationBonus = CurrentTurnPeakEdgeDeg > (CurrentTurnPeakCoMDeg + 3.0f);
+        if (hasAngulationBonus)
         {
-            TurnCount++;
-            ComboCount++;
-
-            float baseScore = CurrentTurnPeakEdgeDeg;
-            bool hasAngulationBonus = CurrentTurnPeakEdgeDeg > (CurrentTurnPeakCoMDeg + 3.0f);
-            if (hasAngulationBonus)
-            {
-                baseScore *= 1.25f;
-            }
-
-            float skidMultiplier = Mathf.Clamp01(1.0f - (_skidDurationInTurn * 0.20f));
-            baseScore *= skidMultiplier;
-
-            float comboMultiplier = 1.0f + (ComboCount - 1) * 0.10f;
-            TotalScore += baseScore * comboMultiplier;
-
-            if (CurrentTurnPeakEdgeDeg >= 65.0f)
-                LastTurnEvaluation = hasAngulationBonus ? "WORLD CUP CARVE!!" : "WORLD CUP SPEED!";
-            else if (CurrentTurnPeakEdgeDeg >= 50.0f)
-                LastTurnEvaluation = hasAngulationBonus ? "DEEP CARVE!" : "SOLID EDGE!";
-            else if (CurrentTurnPeakEdgeDeg >= 35.0f)
-                LastTurnEvaluation = "GOOD TURN";
-            else
-                LastTurnEvaluation = "SHALLOW TURN";
+            baseScore *= 1.25f;
         }
+
+        float skidMultiplier = Mathf.Clamp01(1.0f - (_skidDurationInTurn * 0.20f));
+        baseScore *= skidMultiplier;
+
+        float comboMultiplier = 1.0f + (ComboCount - 1) * 0.10f;
+        TotalScore += baseScore * comboMultiplier;
+
+        if (CurrentTurnPeakEdgeDeg >= 65.0f)
+            LastTurnEvaluation = hasAngulationBonus ? "WORLD CUP CARVE!!" : "WORLD CUP SPEED!";
+        else if (CurrentTurnPeakEdgeDeg >= 50.0f)
+            LastTurnEvaluation = hasAngulationBonus ? "DEEP CARVE!" : "SOLID EDGE!";
+        else if (CurrentTurnPeakEdgeDeg >= 35.0f)
+            LastTurnEvaluation = "GOOD TURN";
         else
-        {
-            ComboCount = 0;
-            LastTurnEvaluation = "RAIL HIT! (0 PT)";
-        }
+            LastTurnEvaluation = "SHALLOW TURN";
 
         LastTurnPeakEdgeDeg = CurrentTurnPeakEdgeDeg;
         LastTurnPeakCoMDeg = CurrentTurnPeakCoMDeg;
         CurrentTurnPeakEdgeDeg = 0f;
         CurrentTurnPeakCoMDeg = 0f;
-        _turnInvalidatedByRail = false;
         _skidDurationInTurn = 0f;
         _timeSinceLastSwitch = 0f;
     }
@@ -743,7 +730,6 @@ public class SkyTechGameController : MonoBehaviour
 
         CurrentTurnPeakEdgeDeg = 0f;
         CurrentTurnPeakCoMDeg = 0f;
-        _turnInvalidatedByRail = false;
         _skidDurationInTurn = 0f;
         _timeSinceLastSwitch = 0f;
         _lastEdgeSign = 0f;

@@ -137,6 +137,43 @@ namespace SkyTechSimulator
             return zInf + (z0 - zInf) * decay;
         }
 
+        private static void SolveSecondOrderExact(
+            ref float q,
+            ref float v,
+            out float a,
+            float qEq,
+            float omega0Sq,
+            float gamma,
+            float fExt,
+            float dt)
+        {
+            float g = AnalyticClamp(gamma, -15.0f, 250.0f);
+            float f0 = fExt - omega0Sq * (q - qEq);
+
+            float gdt = g * dt;
+            float w2dt2 = omega0Sq * dt * dt;
+            float z = gdt * gdt - w2dt2;
+
+            float expFactor = Mathf.Exp(-gdt);
+            float p0 = Phi0(z);
+            float p1 = Phi1(z);
+
+            float G1 = expFactor * dt * p1;
+            float G0 = expFactor * (p0 - gdt * p1);
+            float G2 = expFactor * dt * dt * (
+                0.5f
+                + (1.0f / 6.0f) * gdt
+                + (1.0f / 24.0f) * z
+                + (1.0f / 60.0f) * gdt * z
+                + (1.0f / 720.0f) * z * z
+            );
+
+            float vPrev = v;
+            q = q + G1 * vPrev + G2 * f0;
+            v = G0 * vPrev + G1 * f0 - w2dt2 * (G2 / dt) * vPrev;
+            a = (v - vPrev) / dt;
+        }
+
         private static void SolveSecondOrderBoundedExact(
             ref float q,
             ref float v,
@@ -354,7 +391,7 @@ namespace SkyTechSimulator
             float theta1_des = activeGate * AnalyticClamp(mouseTargetTheta1 + input.phi_lock_cmd, -maxTargetRollRad, maxTargetRollRad);
             float rollError = theta1_des - s.theta1;
 
-            // ★台車 P(x_c, 0) と重心 C(x_c + y_CoM, z_CoM) を結ぶ直線成分でのマウス距離を測定
+            // 台車 P(x_c, 0) と重心 C(x_c + y_CoM, z_CoM) を結ぶ直線成分でのマウス距離を測定
             float comDist = SoftMax(0.15f, Mathf.Sqrt(s.y_CoM * s.y_CoM + s.z_CoM * s.z_CoM));
             float lineDirX = s.y_CoM / comDist;
             float lineDirZ = s.z_CoM / comDist;
@@ -362,7 +399,6 @@ namespace SkyTechSimulator
             float mouseDistAlongComLine;
             if (input.has_mouse_world)
             {
-                // 台車位置 (s.x_c, 0) からマウスワールド位置へのベクトルを台車-重心直線へ射影（内積）
                 float mouseRelX = input.mouse_world.x - s.x_c;
                 float mouseRelZ = input.mouse_world.y;
                 mouseDistAlongComLine = mouseRelX * lineDirX + mouseRelZ * lineDirZ;
@@ -372,19 +408,14 @@ namespace SkyTechSimulator
                 mouseDistAlongComLine = comDist;
             }
 
-            // 距離が近い(<= nearDist)とき straightFactor = 0 (bendRatio = 1: 上体を鉛直まで立てる)
-            // 距離が遠い(>= farDist)とき  straightFactor = 1 (bendRatio = 0: 側屈0で体がストレート)
             float nearDist = SoftMax(0.10f, cfg.comLineNearDist);
             float farDist  = SoftMax(nearDist + 0.15f, cfg.comLineFarDist);
             float straightFactor = AnalyticClamp01((mouseDistAlongComLine - nearDist) / (farDist - nearDist));
             float bendRatio = 1.0f - straightFactor;
 
-            // 後方互換用（他セクションの参照用）
             float mouseDistanceFactor = bendRatio;
             float deepRollFactor = AnalyticClamp01(Mathf.Abs(s.theta1) / (55.0f * Mathf.Deg2Rad));
 
-            // 基準姿勢: bendRatio = 1 で上体鉛直(theta2_ref = 0, phi_ref = theta1)
-            //          bendRatio = 0 で体ストレート(theta2_ref = theta1, phi_ref = 0)
             float phi_ref = AnalyticClamp(bendRatio * s.theta1, -phiMax, phiMax);
             s.theta2_ref = s.theta1 - phi_ref;
 
@@ -434,10 +465,8 @@ namespace SkyTechSimulator
             float inwardOmega = SoftPlus(rollSign * s.omega1);
             float leadTheta1ForHip = s.theta1 + 0.10f * rollSign * inwardOmega;
 
-            // 目標股関節側屈角: bendRatio = 0 のとき phi_target = 0 (ストレート), bendRatio = 1 のとき phi_target = theta1 (上体鉛直)
             float phi_target = (1.0f - gReset) * AnalyticClamp(bendRatio * leadTheta1ForHip, -phiMax, phiMax);
 
-            // phi = 0 (ストレート) から phi = theta1 (上体鉛直) までの全域を許容する可動範囲
             float slackRad = 3.0f * Mathf.Deg2Rad;
             float minPhiActive = AnalyticClamp(SoftMin(0.0f, s.theta1) - slackRad, -phiMax, 0.0f);
             float maxPhiActive = AnalyticClamp(SoftMax(0.0f, s.theta1) + slackRad, 0.0f, phiMax);
@@ -681,32 +710,20 @@ namespace SkyTechSimulator
             float crossUnderPushForce = -cfg.M * maxShiftDesign * du_shift_rate * (0.45f + 0.35f * shallowAngleGate);
 
             float halfRail = cfg.W_rail * 0.5f;
-            float v_c_prev = s.v_c;
             float omegaRailSq = cfg.k_center;
             float gammaRail = c_glide / (2.0f * m_c_eff);
             float fExtRail = (F_drive + F_camber_rebound + activeExtCarriageDrive + crossUnderPushForce + s.skid_pushback_force) / m_c_eff;
 
-            SolveSecondOrderBoundedExact(
-                ref s.x_c, ref s.v_c, out _,
-                0.0f, omegaRailSq, gammaRail, fExtRail,
-                -halfRail, halfRail, safeDt
+            SolveSecondOrderExact(
+                ref s.x_c, ref s.v_c, out float ddx_c,
+                0.0f, omegaRailSq, gammaRail, fExtRail, safeDt
             );
-
-            float atRailEndGate = AnalyticStep(Mathf.Abs(s.x_c), halfRail - 1e-3f, 5e-4f);
-            float pushingOutwardGate = AnalyticStep(s.x_c * v_c_prev, 0.0f, 1e-3f);
-            float bounceGate = atRailEndGate * pushingOutwardGate;
-            s.v_c = Mathf.Lerp(s.v_c, -0.30f * v_c_prev, bounceGate);
-
-            float ddx_c = (s.v_c - v_c_prev) / safeDt;
-
-            float outsideSameSide = AnalyticStep(s.x_c * s.y_CoM, 0.0f, 2e-3f);
-            float outwardFreeGate = 1.0f - atRailEndGate * outsideSameSide;
 
             float v_req = SoftMax(0.08f, Mathf.Abs(s.v_c_target));
             float v_realized = SoftPlus(SmoothSign(s.v_c_target, 0.01f) * s.v_c);
             float raw_eta = 1.0f - AnalyticClamp01((v_req - v_realized) / v_req);
             float rightingFloor = Mathf.Lerp(0.25f, SoftMax(0.75f, cfg.directCarveRightingFloor), carveEngageEnvelope * (1.0f - 0.65f * intentionalRollIn));
-            float eta_carriage = outwardFreeGate * Mathf.Lerp(raw_eta, 1.0f, rightingFloor);
+            float eta_carriage = Mathf.Lerp(raw_eta, 1.0f, rightingFloor);
 
             float skidGripGate = Mathf.Lerp(1.0f, safeSkidGrip, AnalyticClamp01(s.skid_intensity));
             float hipViableGate  = AnalyticStep(s.z_H, cfg.z_H_min, 2e-3f);
@@ -722,9 +739,8 @@ namespace SkyTechSimulator
             s.kappa = s.a_c / vSqSafe;
             s.kappa_target = a_c_target / vSqSafe;
 
-            float railImpactBlend = atRailEndGate * outsideSameSide;
             float baseCoupling = Mathf.Lerp(0.30f, 0.55f, shallowAngleGate * shiftActivity);
-            float ddx_c_coupled = Mathf.Lerp(baseCoupling * AnalyticClamp(ddx_c, -6.5f, 6.5f), ddx_c, railImpactBlend);
+            float ddx_c_coupled = baseCoupling * AnalyticClamp(ddx_c, -6.5f, 6.5f);
             float a_pivot_total = s.a_c + ddx_c_coupled;
 
             // =========================================================================
@@ -739,7 +755,7 @@ namespace SkyTechSimulator
 
             float driveGain = SoftMax(1.2f, cfg.comShiftRollDriveGain) * SoftMax(1.2f, cfg.mouseRollMomentGain * 0.75f);
             float kp_roll_drive = mg * SoftMax(0.45f, s.z_CoM) * 0.52f * driveGain;
-            float tau_roll_drive = (1.0f - gReset) * outwardFreeGate * kp_roll_drive * rollError;
+            float tau_roll_drive = (1.0f - gReset) * kp_roll_drive * rollError;
 
             float tau_switch_push = -(1.0f - gReset) * sigma_out * (1.0f - mouseDistanceFactor)
                                   * SoftMax(0.5f, cfg.extVelocityRightingGain) * mg * 0.28f * sin1;
@@ -774,7 +790,6 @@ namespace SkyTechSimulator
             float kd_hip_critical = 2.0f * Mathf.Sqrt(I2_hip * kp_hip_eff);
             float velThresh = SoftMax(0.05f, cfg.coContractionVelThreshold);
 
-            // 側屈率 bendRatio に応じた目標側屈角速度（ストレート時は dphi_target = 0）
             float dphi_target = (1.0f - gReset) * bendRatio * s.omega1;
             float dphi_error  = s.dphi - dphi_target;
 
@@ -820,7 +835,6 @@ namespace SkyTechSimulator
 
             if (gReset < 0.5f)
             {
-                // ストレート(phi = 0)〜上体鉛直(phi = theta1)の範囲を阻害しないクランプ
                 float postMinPhi = AnalyticClamp(SoftMin(0.0f, s.theta1) - slackRad, -phiMax, 0.0f);
                 float postMaxPhi = AnalyticClamp(SoftMax(0.0f, s.theta1) + slackRad, 0.0f, phiMax);
                 s.phi = AnalyticClamp(s.phi, postMinPhi, postMaxPhi);
@@ -864,9 +878,9 @@ namespace SkyTechSimulator
 
         private static SkiGripState EvaluateGripStateLabel(in SimState s, SkyTechSimConfig cfg, float halfRail, float N_min)
         {
+            if (Mathf.Abs(s.x_c) >= halfRail) return SkiGripState.RailLimitHit;
             if (s.z_H < cfg.z_H_min) return SkiGripState.HipCrash;
             if (Mathf.Abs(s.theta1) >= cfg.theta_bootOutDeg * Mathf.Deg2Rad) return SkiGripState.BootOut;
-            if (Mathf.Abs(s.x_c) >= halfRail - 1e-3f) return SkiGripState.RailLimitHit;
             if (s.snow_stress_ratio >= 1.0f || s.skid_intensity > 0.15f) return SkiGripState.Skidding;
             if (s.F_vert < N_min && s.F_leg < N_min) return SkiGripState.Unweighted;
             return SkiGripState.Carving;
