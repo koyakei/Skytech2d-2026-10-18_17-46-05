@@ -6,13 +6,17 @@ using UnityEngine.InputSystem;
 
 /// <summary>
 /// SkyTechSportスキーシミュレーターのプロシージャル2DビジュアライザーおよびテレメトリHUD。
+/// 操り人形（マリオネット）型の頂点誘導ガイド表示（物理挙動には非干渉）に対応。
 /// </summary>
 [RequireComponent(typeof(SkyTechGameController))]
 public class SkyTechVisualizer : MonoBehaviour
 {
-    [Header("=== 画面中央基準ガイド表示設定 ===")]
+    [Header("=== 画面中央基準・頂点誘導ガイド表示設定 ===")]
     [Tooltip("画面中央の十字基準線（左右重心移動・高さ基準）を表示するか")]
     public bool ShowCenterCrosshair = true;
+
+    [Tooltip("操り人形のように頭頂（一番上の頂点）を誘導する仮想の操り糸・ターゲットガイドを表示するか（物理には無影響）")]
+    public bool ShowPuppetApexGuide = true;
 
     [Tooltip("画面中央から上方向の最大伸長(l_max)目安ラインまでの距離(m)")]
     public float GuideExtendUpRange = 0.55f;
@@ -32,6 +36,11 @@ public class SkyTechVisualizer : MonoBehaviour
     private LineRenderer _mouseGuideLine;
     private LineRenderer _mouseCursorCircle;
 
+    // 操り人形（頂点誘導）ガイド用 LineRenderer（物理非干渉）
+    private LineRenderer _puppetStringLine;
+    private LineRenderer _apexTargetCircle;
+
+    // シミュレーター本体・身体セグメント用 LineRenderer
     private LineRenderer _railLine;
     private LineRenderer _absorberLeft;
     private LineRenderer _absorberRight;
@@ -144,25 +153,30 @@ public class SkyTechVisualizer : MonoBehaviour
         _centerReticleCircle = CreateLineChild("CenterReticle",    0.015f, new Color(0.75f, 0.88f, 1.00f, 0.40f), -2);
         _mouseGuideLine      = CreateLineChild("MouseGuideLine",   0.012f, new Color(1.00f, 0.90f, 0.40f, 0.30f), -1);
 
-        _railLine       = CreateLineChild("Rail",        0.035f, new Color(0.40f, 0.45f, 0.55f, 0.8f), 0);
-        _absorberLeft   = CreateLineChild("AbsorberL",   0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
-        _absorberRight  = CreateLineChild("AbsorberR",   0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
-        _ghostPeakLine  = CreateLineChild("GhostPeak",   0.020f, new Color(0.3f, 0.8f, 1.0f, 0.25f),   2);
-        _carriageLine   = CreateLineChild("Carriage",    0.030f, new Color(0.75f, 0.80f, 0.90f, 0.9f), 3);
-        _skiBoardLine   = CreateLineChild("SkiBoard",    0.045f, new Color(0.90f, 0.95f, 1.00f, 1.0f), 4);
-        _legLine        = CreateLineChild("LegSegment",  0.065f, Color.cyan,                            5);
-        _trunkLine      = CreateLineChild("TrunkSegment",0.075f, new Color(0.9f, 0.9f, 0.95f, 1.0f),    6);
-        _hipJointCircle = CreateLineChild("HipJoint",    0.025f, new Color(1.0f, 0.8f, 0.2f, 1.0f),    7);
-        _headCircle     = CreateLineChild("HeadCircle",  0.030f, new Color(1.0f, 0.85f, 0.7f, 1.0f),   7);
-        _twoComDistLine = CreateLineChild("TwoCoMLine",  0.015f, new Color(1.0f, 1.0f, 1.0f, 0.45f),  8);
-        _comLine        = CreateLineChild("CoMLine",     0.015f, new Color(1.0f, 0.95f, 0.2f, 0.45f),  8);
-        _lowerComCircle = CreateLineChild("LowerCoMCircle", 0.025f, new Color(0.0f, 0.90f, 1.0f, 1.0f), 9);
-        _upperComCircle = CreateLineChild("UpperCoMCircle", 0.042f, new Color(1.0f, 0.20f, 0.50f, 1.0f), 9);
-        _comCircle      = CreateLineChild("CoMCircle",   0.025f, new Color(1.0f, 0.92f, 0.15f, 1.0f),  10);
-        _forceLine      = CreateLineChild("ForceVector", 0.040f, Color.green,                           11);
+        // レール・機体・身体リンク
+        _railLine        = CreateLineChild("Rail",          0.035f, new Color(0.40f, 0.45f, 0.55f, 0.8f), 0);
+        _absorberLeft    = CreateLineChild("AbsorberL",     0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
+        _absorberRight   = CreateLineChild("AbsorberR",     0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
+        _ghostPeakLine   = CreateLineChild("GhostPeak",     0.020f, new Color(0.3f, 0.8f, 1.0f, 0.25f),   2);
+        _carriageLine    = CreateLineChild("Carriage",      0.030f, new Color(0.75f, 0.80f, 0.90f, 0.9f), 3);
+        _skiBoardLine    = CreateLineChild("SkiBoard",      0.045f, new Color(0.90f, 0.95f, 1.00f, 1.0f), 4);
+        _legLine         = CreateLineChild("LegSegment",    0.065f, Color.cyan,                           5);
+        _trunkLine       = CreateLineChild("TrunkSegment",  0.075f, new Color(0.9f, 0.9f, 0.95f, 1.0f),   6);
+        _hipJointCircle  = CreateLineChild("HipJoint",      0.025f, new Color(1.0f, 0.8f, 0.2f, 1.0f),    7);
+        _headCircle      = CreateLineChild("HeadCircle",    0.030f, new Color(1.0f, 0.85f, 0.7f, 1.0f),   7);
+        _twoComDistLine  = CreateLineChild("TwoCoMLine",    0.015f, new Color(1.0f, 1.0f, 1.0f, 0.45f),   8);
+        _comLine         = CreateLineChild("CoMLine",       0.015f, new Color(1.0f, 0.95f, 0.2f, 0.45f),  8);
+        _lowerComCircle  = CreateLineChild("LowerCoMCircle",0.025f, new Color(0.0f, 0.90f, 1.0f, 1.0f),   9);
+        _upperComCircle  = CreateLineChild("UpperCoMCircle",0.042f, new Color(1.0f, 0.20f, 0.50f, 1.0f),  9);
+        _comCircle       = CreateLineChild("CoMCircle",     0.025f, new Color(1.0f, 0.92f, 0.15f, 1.0f),  10);
+        _forceLine       = CreateLineChild("ForceVector",   0.040f, Color.green,                          11);
+
+        // 操り人形（頂点誘導）ガイド線とターゲットリング
+        _puppetStringLine = CreateLineChild("PuppetStringLine", 0.014f, new Color(1.0f, 0.85f, 0.45f, 0.55f), 12);
+        _apexTargetCircle = CreateLineChild("ApexTargetCircle", 0.016f, new Color(0.45f, 1.0f, 0.75f, 0.65f), 12);
 
         // マウスカーソル位置マーカー
-        _mouseCursorCircle = CreateLineChild("MouseCursor", 0.018f, new Color(1.0f, 0.92f, 0.35f, 0.75f), 12);
+        _mouseCursorCircle = CreateLineChild("MouseCursor", 0.018f, new Color(1.0f, 0.92f, 0.35f, 0.75f), 13);
     }
 
     private LineRenderer CreateLineChild(string objName, float width, Color color, int sortingOrder)
@@ -228,12 +242,11 @@ public class SkyTechVisualizer : MonoBehaviour
         _centerHorizLine.SetPosition(0, new Vector3(centerWorld.x - orthoW * 0.95f, centerWorld.y, 0f));
         _centerHorizLine.SetPosition(1, new Vector3(centerWorld.x + orthoW * 0.95f, centerWorld.y, 0f));
 
-        // 2. 画面中央の垂直基準線（左右重心移動の基準 = x_center）
+        // 2. 画面中央の垂直基準線（左右頂点誘導・側屈中立の基準 = x_center）
         _centerVertLine.positionCount = 2;
         _centerVertLine.SetPosition(0, new Vector3(centerWorld.x, centerWorld.y - orthoH * 0.95f, 0f));
         _centerVertLine.SetPosition(1, new Vector3(centerWorld.x, centerWorld.y + orthoH * 0.95f, 0f));
 
-        // 左右入力に応じて垂直基準線の色味をわずかにハイライト
         float steerMag = Mathf.Abs(input.phi_steer_cmd);
         Color vertCol = Color.Lerp(
             new Color(0.55f, 0.75f, 0.95f, 0.28f),
@@ -279,7 +292,6 @@ public class SkyTechVisualizer : MonoBehaviour
             Vector3 mPos3 = new Vector3(mouseWorld.x, mouseWorld.y, 0f);
             SetCirclePositions(_mouseCursorCircle, mPos3, 0.042f, 16);
 
-            // 画面中央 → (mouseWorld.x, centerWorld.y) → (mouseWorld.x, mouseWorld.y) のL字オフセット表示
             _mouseGuideLine.positionCount = 3;
             _mouseGuideLine.SetPosition(0, new Vector3(centerWorld.x, centerWorld.y, 0f));
             _mouseGuideLine.SetPosition(1, new Vector3(mouseWorld.x, centerWorld.y, 0f));
@@ -409,6 +421,9 @@ public class SkyTechVisualizer : MonoBehaviour
 
         SetCirclePositions(_headCircle, HeadPos, 0.075f, 20);
 
+        // 操り人形（頂点誘導）ガイドの描画（物理挙動には一切力を加えない純粋な視覚ガイド）
+        UpdatePuppetApexGuide(P, HeadPos, state, input, cfg);
+
         Vector3 CoM1 = P + new Vector3(cfg.c1 * state.l1 * sinTheta1, cfg.c1 * state.l1 * cosTheta1, 0f);
         SetCirclePositions(_lowerComCircle, CoM1, 0.040f, 16);
 
@@ -474,6 +489,61 @@ public class SkyTechVisualizer : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// マウス入力に基づく「目標頭頂位置（Apex Target）」と実際の頭頂（HeadPos）を結ぶ操り糸ガイドを更新します。
+    /// ※視覚表示のみであり、物理ソルバーの運動方程式には一切影響を与えません。
+    /// </summary>
+    private void UpdatePuppetApexGuide(Vector3 footPos, Vector3 headPos, in SimState state, in SimInput input, SkyTechSimConfig cfg)
+    {
+        if (!ShowPuppetApexGuide || !_controller.UseMouseControl)
+        {
+            _puppetStringLine.positionCount = 0;
+            _apexTargetCircle.positionCount = 0;
+            return;
+        }
+
+        Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
+        if (cam == null || !TryGetMouseWorldPosForVis(cam, out Vector2 mouseWorld))
+        {
+            _puppetStringLine.positionCount = 0;
+            _apexTargetCircle.positionCount = 0;
+            return;
+        }
+
+        float depth = -cam.transform.position.z;
+        Vector3 centerScreen = new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, depth);
+        Vector3 centerWorld3 = cam.ScreenToWorldPoint(centerScreen);
+        float dx = mouseWorld.x - centerWorld3.x;
+
+        // 足元(キャリッジ位置)を基準に、現在のマウス操作が誘導している目標頭頂位置を算出
+        float headReach = cfg.l2 * 1.55f;
+        float targetL1 = (input.l1_target > 0.05f) ? input.l1_target : state.l1;
+        float totalReach = targetL1 + headReach;
+
+        float maxLateralReach = Mathf.Clamp(dx, -totalReach * 0.85f, totalReach * 0.85f);
+        float targetApexX = footPos.x + maxLateralReach;
+        float targetApexY = Mathf.Sqrt(Mathf.Max(0.04f, totalReach * totalReach - maxLateralReach * maxLateralReach));
+        Vector3 apexTargetPos = new Vector3(targetApexX, targetApexY, 0f);
+
+        SetCirclePositions(_apexTargetCircle, apexTargetPos, 0.052f, 18);
+
+        // 頭頂(HeadPos) → 足元基準の目標頂点(apexTargetPos) → マウスカーソル(mouseWorld) を結ぶ操り糸ガイド
+        Vector3 mousePos3 = new Vector3(mouseWorld.x, mouseWorld.y, 0f);
+        _puppetStringLine.positionCount = 3;
+        _puppetStringLine.SetPosition(0, headPos);
+        _puppetStringLine.SetPosition(1, apexTargetPos);
+        _puppetStringLine.SetPosition(2, mousePos3);
+
+        // 中央戻し（側屈伸展＋脚プッシュ）時はエメラルドグリーン、左右誘導時はゴールドに変化
+        Color stringCol = Color.Lerp(
+            new Color(1.0f, 0.85f, 0.40f, 0.50f),
+            new Color(0.30f, 1.0f, 0.65f, 0.80f),
+            input.u_ext_norm
+        );
+        _puppetStringLine.startColor = stringCol;
+        _puppetStringLine.endColor = new Color(stringCol.r, stringCol.g, stringCol.b, 0.25f);
+    }
+
     private void SetCirclePositions(LineRenderer lr, Vector3 center, float radius, int segments)
     {
         lr.positionCount = segments + 1;
@@ -524,7 +594,8 @@ public class SkyTechVisualizer : MonoBehaviour
         {
             fontSize = 11,
             normal = { textColor = new Color(0.80f, 0.85f, 0.92f) },
-            alignment = TextAnchor.MiddleLeft
+            alignment = TextAnchor.MiddleLeft,
+            richText = true
         };
 
         _valueStyle = new GUIStyle(GUI.skin.label)
@@ -532,7 +603,8 @@ public class SkyTechVisualizer : MonoBehaviour
             fontSize = 11,
             fontStyle = FontStyle.Bold,
             normal = { textColor = Color.white },
-            alignment = TextAnchor.MiddleRight
+            alignment = TextAnchor.MiddleRight,
+            richText = true
         };
 
         _badgeStyle = new GUIStyle(GUI.skin.box)
@@ -547,7 +619,8 @@ public class SkyTechVisualizer : MonoBehaviour
         {
             fontSize = 11,
             normal = { textColor = new Color(0.75f, 0.82f, 0.90f) },
-            alignment = TextAnchor.MiddleCenter
+            alignment = TextAnchor.MiddleCenter,
+            richText = true
         };
 
         _centerTagStyle = new GUIStyle(GUI.skin.label)
@@ -584,9 +657,9 @@ public class SkyTechVisualizer : MonoBehaviour
         float cx = Screen.width * 0.5f;
         float cy = Screen.height * 0.5f;
 
-        GUI.Label(new Rect(cx + 10f, cy - 18f, 190f, 18f), "CENTER (左右重心中立 / 基準高)", _centerTagStyle);
-        GUI.Label(new Rect(cx - 125f, cy + 4f, 115f, 18f), "← 左重心シフト", _centerTagStyle);
-        GUI.Label(new Rect(cx + 10f, cy + 4f, 115f, 18f), "右重心シフト →", _centerTagStyle);
+        GUI.Label(new Rect(cx + 10f, cy - 18f, 230f, 18f), "CENTER (側屈伸展・上体直立 / 基準高)", _centerTagStyle);
+        GUI.Label(new Rect(cx - 140f, cy + 4f, 130f, 18f), "← 左へ頭頂誘導・側屈", _centerTagStyle);
+        GUI.Label(new Rect(cx + 10f, cy + 4f, 130f, 18f), "右へ頭頂誘導・側屈 →", _centerTagStyle);
     }
 
     private void DrawBiomechanicsPanel(in SimState state, SkyTechSimConfig cfg)
@@ -736,18 +809,18 @@ public class SkyTechVisualizer : MonoBehaviour
 
     private void DrawControlsGuidePanel()
     {
-        float panelW = Mathf.Min(760, Screen.width - 30);
+        float panelW = Mathf.Min(780, Screen.width - 30);
         Rect panelRect = new Rect((Screen.width - panelW) * 0.5f, Screen.height - 62, panelW, 50);
         GUI.Box(panelRect, GUIContent.none, _panelStyle);
 
         float curY = panelRect.y + 6;
         GUI.Label(new Rect(panelRect.x, curY, panelW, 18),
-            $"<color=#F4D03F>[Q / E]</color> ロール倒れ込み(±2° / 長押し連続: {_controller.TargetLegRollDeg:+0;-0;0}°)   |   <color=#2ECC71>[W]</color> 中立(0°)リセット   |   <color=#58D68D>[Space / ↑ / マウス上]</color> 脚伸展   |   <color=#85C1E9>[S / マウス下]</color> 屈曲",
+            $"<color=#F4D03F>[Q / E]</color> ロール倒れ込み(±2°: {_controller.TargetLegRollDeg:+0;-0;0}°)   |   <color=#2ECC71>[W]</color> 直立リセット   |   <color=#58D68D>[Space / ↑ / マウス中央・上戻し]</color> 側屈伸展＋脚プッシュ   |   <color=#85C1E9>[S / マウス下]</color> 屈曲",
             _guideStyle);
 
         curY += 18;
         GUI.Label(new Rect(panelRect.x, curY, panelW, 18),
-            "<color=#5DADE2>[A / D or ← / → or 画面中央より左右マウス]</color> 体幹側屈(重心移動)   |   <color=#F39C12>[↓]</color> 側屈中立戻し   |   <color=#E74C3C>[R]</color> リセット",
+            "<color=#5DADE2>[マウス左右 / A・D]</color> 頭頂(頂点)誘導＆深角側屈   |   <color=#F39C12>[外側のマウスを中央へ戻す / ↓]</color> 上体の側屈を伸ばしてターン切り替え   |   <color=#E74C3C>[R]</color> リセット",
             _guideStyle);
     }
 

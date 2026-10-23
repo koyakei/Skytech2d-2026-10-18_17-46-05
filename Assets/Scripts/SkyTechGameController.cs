@@ -29,16 +29,16 @@ public class SkyTechGameController : MonoBehaviour
     public MouseHeightControlMode HeightControlMode = MouseHeightControlMode.VerticalSignedFromCenter;
 
     [Tooltip("[VerticalSignedFromCenter用] 画面中央から上方向へこの距離(m)動かすと最大伸長(l_max)")]
-    public float MouseExtendUpRange = 0.55f;
+    public float MouseExtendUpRange = 0.50f;
 
     [Tooltip("[VerticalSignedFromCenter用] 画面中央から下方向へこの距離(m)動かすと最小屈曲(l_min)")]
-    public float MouseFlexDownRange = 0.85f;
+    public float MouseFlexDownRange = 0.75f;
 
     [Tooltip("[Distance系モード用] 画面中央からこの距離(m)以下に近づくと脚を最大長(l_max)まで伸長")]
-    public float MouseFullExtendDist = 0.40f;
+    public float MouseFullExtendDist = 0.35f;
 
     [Tooltip("[Distance系モード用] 画面中央からこの距離(m)以上に離れると脚を最小長(l_min)まで短縮")]
-    public float MouseFullFlexDist = 1.45f;
+    public float MouseFullFlexDist = 1.35f;
 
     [Tooltip("画面の左右中央線上でのチャタリング防止用微小デッドゾーン(m)")]
     public float MouseLineDeadzone = 0.005f;
@@ -67,6 +67,11 @@ public class SkyTechGameController : MonoBehaviour
     private bool _turnInvalidatedByRail = false;
     private float _skidDurationInTurn = 0f;
     private bool _isSteerNeutralActive = false;
+
+    // 外側マウスの中央戻し検出＆脚プッシュ連動用状態変数
+    private float _prevAbsDx = 0f;
+    private bool _hasPrevMouseSample = false;
+    private float _centerReturnPushBoost = 0f;
 
     private float _leftRollHoldTimer = 0f;
     private float _leftRollRepeatTimer = 0f;
@@ -147,6 +152,7 @@ public class SkyTechGameController : MonoBehaviour
             _input.steer_neutral_cmd = false;
             _input.w_reset = false;
             _isSteerNeutralActive = false;
+            _centerReturnPushBoost = 0f;
             return;
         }
 
@@ -179,6 +185,7 @@ public class SkyTechGameController : MonoBehaviour
             _leftRollRepeatTimer = 0f;
             _rightRollHoldTimer = 0f;
             _rightRollRepeatTimer = 0f;
+            _centerReturnPushBoost = 0f;
         }
         else
         {
@@ -278,7 +285,37 @@ public class SkyTechGameController : MonoBehaviour
         Vector2 screenCenterWorld = Vector2.zero;
         bool hasMouseWorld = UseMouseControl && TryGetMouseWorldPosition(out mouseWorld, out screenCenterWorld);
 
-        // --- 1. 脚の伸縮入力（キーボード優先、未押下時は画面中央基準で高さを制御） ---
+        // --- 0. 外側に移動したマウスを中央に戻す求心動作の検出（上体側屈伸展＋脚プッシュ連動） ---
+        float safeDt = Mathf.Max(1e-4f, Time.deltaTime);
+        if (hasMouseWorld && Config != null)
+        {
+            float absDx = Mathf.Abs(mouseWorld.x - screenCenterWorld.x);
+            if (_hasPrevMouseSample)
+            {
+                // 外側から中央へ向かう移動速度 (-d|dx|/dt > 0)
+                float inwardSpeed = Mathf.Max(0f, (_prevAbsDx - absDx) / safeDt);
+                float turnBankGate = Mathf.Clamp01((Mathf.Abs(_state.theta1) * Mathf.Rad2Deg - 8.0f) / 14.0f);
+                float returnTarget = Mathf.Clamp01((inwardSpeed / 1.6f) * Config.centerReturnPushGain) * turnBankGate;
+
+                if (returnTarget > _centerReturnPushBoost)
+                {
+                    _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, returnTarget, 12.0f * safeDt);
+                }
+                else
+                {
+                    _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, 0f, 3.2f * safeDt);
+                }
+            }
+            _prevAbsDx = absDx;
+            _hasPrevMouseSample = true;
+        }
+        else
+        {
+            _hasPrevMouseSample = false;
+            _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, 0f, 4.0f * safeDt);
+        }
+
+        // --- 1. 脚の伸縮入力（キーボード優先、未押下時は画面中央基準の高さ＋中央戻しプッシュ連動） ---
         if (extPressed || flexPressed)
         {
             _input.l1_target = 0f;
@@ -311,7 +348,7 @@ public class SkyTechGameController : MonoBehaviour
             float dy = mouseWorld.y - screenCenterWorld.y;
             float neutralL1 = Mathf.Clamp(Config.l_max - Config.supportDropFromMaxMeters, Config.l_min, Config.l_max);
 
-            float targetL1 = HeightControlMode switch
+            float baseTargetL1 = HeightControlMode switch
             {
                 MouseHeightControlMode.VerticalSignedFromCenter =>
                     neutralL1 + Mathf.Clamp(dy / Mathf.Max(0.05f, dy >= 0f ? MouseExtendUpRange : MouseFlexDownRange), -1f, 1f)
@@ -324,20 +361,21 @@ public class SkyTechGameController : MonoBehaviour
                     Mathf.Lerp(Config.l_max, Config.l_min, Mathf.InverseLerp(MouseFullExtendDist, MouseFullFlexDist, Vector2.Distance(mouseWorld, screenCenterWorld)))
             };
 
+            // 外側に移動したマウスを中央へ戻す際、側屈の伸展に合わせて目標脚長も伸展方向(l_max)へブースト
+            float targetL1 = Mathf.Lerp(baseTargetL1, Config.l_max, _centerReturnPushBoost * 0.85f);
             _input.l1_target = targetL1;
 
-            // 位置誤差から現在の速度(dl1)を差し引いてオーバーシュートを防ぎ、二乗特性(drive * |drive|)で中央付近を滑らかに鎮静化
             float dampedError = (targetL1 - _state.l1) - 0.08f * _state.dl1;
             float linDrive = Mathf.Clamp(dampedError / 0.12f, -1.0f, 1.0f);
             float smoothDrive = linDrive * Mathf.Abs(linDrive);
 
-            // 上端(l_max)へ動かしたとき、または下端(l_min)へ向かって実際に脚を縮めている最中のみブースト
             float topBoost    = Mathf.SmoothStep(0f, 1f, (targetL1 - (Config.l_max - 0.03f)) / 0.025f);
             float bottomBoost = Mathf.SmoothStep(0f, 1f, ((Config.l_min + 0.03f) - targetL1) / 0.025f)
                               * Mathf.Clamp01((_state.l1 - targetL1) / 0.03f);
 
-            float extTarget  = Mathf.Max(Mathf.Max(0f, smoothDrive), topBoost);
-            float flexTarget = Mathf.Max(Mathf.Max(0f, -smoothDrive), bottomBoost);
+            // 中央戻し操作による脚伸展プッシュ(_centerReturnPushBoost)を合算
+            float extTarget  = Mathf.Max(Mathf.Max(0f, smoothDrive), Mathf.Max(topBoost, _centerReturnPushBoost));
+            float flexTarget = Mathf.Max(Mathf.Max(0f, -smoothDrive), bottomBoost) * (1.0f - _centerReturnPushBoost);
 
             _input.u_ext_norm  = Mathf.MoveTowards(_input.u_ext_norm,  extTarget,  35.0f * Time.deltaTime);
             _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, flexTarget, 24.0f * Time.deltaTime);
@@ -354,7 +392,7 @@ public class SkyTechGameController : MonoBehaviour
             _input.u_flex_norm = 0f;
         }
 
-        // --- 2. 左右ステアリング入力（マウス横移動距離に応じたアナログ比例制御） ---
+        // --- 2. 左右の頂点誘導入力（浅角では頭頂を同方向へ誘導、深角では側屈量を制御し中央戻しで上体伸展） ---
         float steer = 0f;
         bool kbLeft = IsKeyHeld(KeyCode.A, KeyCodeToKey(KeyCode.A)) || IsKeyHeld(KeyCode.LeftArrow, KeyCodeToKey(KeyCode.LeftArrow));
         bool kbRight = IsKeyHeld(KeyCode.D, KeyCodeToKey(KeyCode.D)) || IsKeyHeld(KeyCode.RightArrow, KeyCodeToKey(KeyCode.RightArrow));
@@ -371,10 +409,10 @@ public class SkyTechGameController : MonoBehaviour
 
             if (absDx > MouseLineDeadzone)
             {
-                float fullRange = (Config != null) ? Mathf.Max(0.15f, Config.mouseSteerFullRange) : 1.15f;
+                float fullRange = (Config != null) ? Mathf.Max(0.15f, Config.mouseSteerFullRange) : 1.05f;
                 float normSteer = Mathf.Clamp01((absDx - MouseLineDeadzone) / fullRange);
-                // 少しの動きではマイルドに、大きく動かしたときに強く効くカーブ
-                steer = Mathf.Sign(dx) * Mathf.Lerp(normSteer, normSteer * normSteer, 0.35f);
+                // 浅い角度での細やかな頭頂誘導と大きな移動での強い側屈を両立するスムーズな特性
+                steer = Mathf.Sign(dx) * Mathf.Lerp(normSteer, normSteer * normSteer, 0.25f);
             }
         }
 
@@ -682,6 +720,9 @@ public class SkyTechGameController : MonoBehaviour
         _state = SkyTechPhysicsSolver.CreateInitialState(Config);
         _lockedHipDeg = 0f;
         _isSteerNeutralActive = false;
+        _prevAbsDx = 0f;
+        _hasPrevMouseSample = false;
+        _centerReturnPushBoost = 0f;
         _input = new SimInput
         {
             u_ext_norm = 0f,
