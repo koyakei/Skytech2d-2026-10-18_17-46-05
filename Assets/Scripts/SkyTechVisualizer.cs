@@ -1,84 +1,36 @@
 using UnityEngine;
 using SkyTechSimulator;
-#if ENABLE_INPUT_SYSTEM
-using UnityEngine.InputSystem;
-#endif
 
-/// <summary>
-/// SkyTechSportスキーシミュレーターのプロシージャル2DビジュアライザーおよびテレメトリHUD。
-/// 操り人形（マリオネット）型の頂点誘導ガイド表示（物理挙動には非干渉）に対応。
-/// </summary>
 [RequireComponent(typeof(SkyTechGameController))]
 public class SkyTechVisualizer : MonoBehaviour
 {
     [Header("=== 画面中央基準・頂点誘導ガイド表示設定 ===")]
-    [Tooltip("画面中央の十字基準線（左右重心移動・高さ基準）を表示するか")]
     public bool ShowCenterCrosshair = true;
-
-    [Tooltip("操り人形のように頭頂（一番上の頂点）を誘導する仮想の操り糸・ターゲットガイドを表示するか（物理には無影響）")]
     public bool ShowPuppetApexGuide = true;
-
-    [Tooltip("画面中央から上方向の最大伸長(l_max)目安ラインまでの距離(m)")]
     public float GuideExtendUpRange = 0.55f;
-
-    [Tooltip("画面中央から下方向の最小屈曲(l_min)目安ラインまでの距離(m)")]
-    public float GuideFlexDownRange = 0.85f;
+    public float GuideFlexDownRange = 0.75f;
 
     private SkyTechGameController _controller;
     private Material _lineMaterial;
 
-    // 画面中央基準ガイド用 LineRenderer
-    private LineRenderer _centerHorizLine;
-    private LineRenderer _centerVertLine;
-    private LineRenderer _centerReticleCircle;
-    private LineRenderer _heightMaxTickLine;
-    private LineRenderer _heightMinTickLine;
-    private LineRenderer _mouseGuideLine;
-    private LineRenderer _mouseCursorCircle;
+    private LineRenderer _centerHorizLine, _leanInThresholdLine, _centerVertLine, _centerReticleCircle;
+    private LineRenderer _heightMaxTickLine, _heightMinTickLine, _mouseGuideLine, _mouseCursorCircle;
+    private LineRenderer _puppetStringLine, _apexTargetCircle;
+    private LineRenderer _railLine, _absorberLeft, _absorberRight, _carriageLine, _skiBoardLine;
+    private LineRenderer _legLine, _trunkLine, _hipJointCircle, _headCircle;
+    private LineRenderer _comCircle, _comLine, _lowerComCircle, _upperComCircle, _twoComDistLine;
+    private LineRenderer _forceLine, _ghostPeakLine;
 
-    // 操り人形（頂点誘導）ガイド用 LineRenderer（物理非干渉）
-    private LineRenderer _puppetStringLine;
-    private LineRenderer _apexTargetCircle;
-
-    // シミュレーター本体・身体セグメント用 LineRenderer
-    private LineRenderer _railLine;
-    private LineRenderer _absorberLeft;
-    private LineRenderer _absorberRight;
-    private LineRenderer _carriageLine;
-    private LineRenderer _skiBoardLine;
-    private LineRenderer _legLine;
-    private LineRenderer _trunkLine;
-    private LineRenderer _hipJointCircle;
-    private LineRenderer _headCircle;
-    private LineRenderer _comCircle;
-    private LineRenderer _comLine;
-    private LineRenderer _lowerComCircle;
-    private LineRenderer _upperComCircle;
-    private LineRenderer _twoComDistLine;
-    private LineRenderer _forceLine;
-    private LineRenderer _ghostPeakLine;
-
-    private Texture2D _panelBgTex;
-    private Texture2D _barBgTex;
-    private Texture2D _barFillTex;
-    private Texture2D _badgeTex;
-    private GUIStyle _panelStyle;
-    private GUIStyle _titleStyle;
-    private GUIStyle _labelStyle;
-    private GUIStyle _valueStyle;
-    private GUIStyle _badgeStyle;
-    private GUIStyle _guideStyle;
-    private GUIStyle _centerTagStyle;
-    private bool _guiInitialized = false;
+    private Texture2D _panelBgTex, _barBgTex, _barFillTex, _badgeTex;
+    private GUIStyle _panelStyle, _titleStyle, _labelStyle, _valueStyle, _badgeStyle, _guideStyle, _centerTagStyle;
+    private bool _guiInitialized;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void AutoInitializeIfMissing()
     {
-        SkyTechGameController existing = Object.FindAnyObjectByType<SkyTechGameController>();
-        if (existing == null)
+        if (Object.FindAnyObjectByType<SkyTechGameController>() == null)
         {
-            GameObject simObj = new GameObject("SkyTechSimulator");
-            simObj.AddComponent<SkyTechVisualizer>();
+            new GameObject("SkyTechSimulator").AddComponent<SkyTechVisualizer>();
             Debug.Log("<color=#58D68D>[SkyTechVisualizer] シーン内にSkyTechSimulatorを自動生成しました。Playを開始します！</color>");
         }
     }
@@ -94,11 +46,7 @@ public class SkyTechVisualizer : MonoBehaviour
                      ?? Shader.Find("Unlit/Color")
                      ?? Shader.Find("Hidden/Internal-Colored");
 
-        _lineMaterial = new Material(shader)
-        {
-            hideFlags = HideFlags.DontSave
-        };
-
+        _lineMaterial = new Material(shader) { hideFlags = HideFlags.DontSave };
         SetupLineRenderers();
     }
 
@@ -107,18 +55,14 @@ public class SkyTechVisualizer : MonoBehaviour
         Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
         if (cam == null)
         {
-            GameObject camObj = new GameObject("Main Camera");
-            cam = camObj.AddComponent<Camera>();
-            camObj.tag = "MainCamera";
+            cam = new GameObject("Main Camera") { tag = "MainCamera" }.AddComponent<Camera>();
         }
 
         cam.orthographic = true;
         float halfRail = (_controller != null && _controller.Config != null) ? _controller.Config.W_rail * 0.5f : 3.60f;
         float aspect = (cam.pixelWidth > 0 && cam.pixelHeight > 0) ? (float)cam.pixelWidth / cam.pixelHeight : (16f / 9f);
-        float requiredSizeByWidth = (halfRail + 0.35f) / Mathf.Max(0.5f, aspect);
-        cam.orthographicSize = Mathf.Max(1.6f, requiredSizeByWidth);
-        cam.transform.position = new Vector3(0f, 0.85f, -10f);
-        cam.transform.rotation = Quaternion.identity;
+        cam.orthographicSize = Mathf.Max(1.6f, (halfRail + 0.35f) / Mathf.Max(0.5f, aspect));
+        cam.transform.SetPositionAndRotation(new Vector3(0f, 0.85f, -10f), Quaternion.identity);
         cam.backgroundColor = new Color(0.063f, 0.082f, 0.125f);
         cam.clearFlags = CameraClearFlags.SolidColor;
     }
@@ -131,55 +75,46 @@ public class SkyTechVisualizer : MonoBehaviour
 
     private void LateUpdate()
     {
-        if (_controller == null) return;
-
+        if (_controller == null || _controller.Config == null) return;
         SimState state = _controller.CurrentState;
         SimInput input = _controller.CurrentInput;
-        SkyTechSimConfig cfg = _controller.Config;
-
-        if (cfg == null) return;
-
-        UpdateCenterCrosshairGeometry(state, input);
-        UpdateDynamicGeometry(state, input, cfg);
+        UpdateCenterCrosshairGeometry(input);
+        UpdateDynamicGeometry(state, input, _controller.Config);
     }
 
     private void SetupLineRenderers()
     {
-        // 背景の画面中央基準ガイド（キャラクターやレールより背面に描画）
-        _centerHorizLine     = CreateLineChild("CenterHorizGuide", 0.014f, new Color(0.55f, 0.75f, 0.95f, 0.22f), -4);
-        _centerVertLine      = CreateLineChild("CenterVertGuide",  0.014f, new Color(0.55f, 0.75f, 0.95f, 0.28f), -4);
-        _heightMaxTickLine   = CreateLineChild("HeightMaxTick",    0.016f, new Color(0.35f, 0.95f, 0.60f, 0.35f), -3);
-        _heightMinTickLine   = CreateLineChild("HeightMinTick",    0.016f, new Color(0.35f, 0.75f, 1.00f, 0.35f), -3);
-        _centerReticleCircle = CreateLineChild("CenterReticle",    0.015f, new Color(0.75f, 0.88f, 1.00f, 0.40f), -2);
-        _mouseGuideLine      = CreateLineChild("MouseGuideLine",   0.012f, new Color(1.00f, 0.90f, 0.40f, 0.30f), -1);
+        _centerHorizLine     = CreateLine("CenterHorizGuide",  0.014f, new Color(0.55f, 0.75f, 0.95f, 0.25f), -4);
+        _leanInThresholdLine = CreateLine("LeanInGuideLine",   0.014f, new Color(1.00f, 0.45f, 0.75f, 0.32f), -4);
+        _centerVertLine      = CreateLine("CenterVertGuide",   0.014f, new Color(0.55f, 0.75f, 0.95f, 0.28f), -4);
+        _heightMaxTickLine   = CreateLine("HeightMaxTick",     0.016f, new Color(0.35f, 0.95f, 0.60f, 0.35f), -3);
+        _heightMinTickLine   = CreateLine("HeightMinTick",     0.016f, new Color(1.00f, 0.60f, 0.25f, 0.35f), -3);
+        _centerReticleCircle = CreateLine("CenterReticle",     0.015f, new Color(0.75f, 0.88f, 1.00f, 0.40f), -2);
+        _mouseGuideLine      = CreateLine("MouseGuideLine",    0.012f, new Color(1.00f, 0.90f, 0.40f, 0.30f), -1);
 
-        // レール・機体・身体リンク
-        _railLine        = CreateLineChild("Rail",          0.035f, new Color(0.40f, 0.45f, 0.55f, 0.8f), 0);
-        _absorberLeft    = CreateLineChild("AbsorberL",     0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
-        _absorberRight   = CreateLineChild("AbsorberR",     0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
-        _ghostPeakLine   = CreateLineChild("GhostPeak",     0.020f, new Color(0.3f, 0.8f, 1.0f, 0.25f),   2);
-        _carriageLine    = CreateLineChild("Carriage",      0.030f, new Color(0.75f, 0.80f, 0.90f, 0.9f), 3);
-        _skiBoardLine    = CreateLineChild("SkiBoard",      0.045f, new Color(0.90f, 0.95f, 1.00f, 1.0f), 4);
-        _legLine         = CreateLineChild("LegSegment",    0.065f, Color.cyan,                           5);
-        _trunkLine       = CreateLineChild("TrunkSegment",  0.075f, new Color(0.9f, 0.9f, 0.95f, 1.0f),   6);
-        _hipJointCircle  = CreateLineChild("HipJoint",      0.025f, new Color(1.0f, 0.8f, 0.2f, 1.0f),    7);
-        _headCircle      = CreateLineChild("HeadCircle",    0.030f, new Color(1.0f, 0.85f, 0.7f, 1.0f),   7);
-        _twoComDistLine  = CreateLineChild("TwoCoMLine",    0.015f, new Color(1.0f, 1.0f, 1.0f, 0.45f),   8);
-        _comLine         = CreateLineChild("CoMLine",       0.015f, new Color(1.0f, 0.95f, 0.2f, 0.45f),  8);
-        _lowerComCircle  = CreateLineChild("LowerCoMCircle",0.025f, new Color(0.0f, 0.90f, 1.0f, 1.0f),   9);
-        _upperComCircle  = CreateLineChild("UpperCoMCircle",0.042f, new Color(1.0f, 0.20f, 0.50f, 1.0f),  9);
-        _comCircle       = CreateLineChild("CoMCircle",     0.025f, new Color(1.0f, 0.92f, 0.15f, 1.0f),  10);
-        _forceLine       = CreateLineChild("ForceVector",   0.040f, Color.green,                          11);
+        _railLine        = CreateLine("Rail",           0.035f, new Color(0.40f, 0.45f, 0.55f, 0.8f), 0);
+        _absorberLeft    = CreateLine("AbsorberL",      0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
+        _absorberRight   = CreateLine("AbsorberR",      0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
+        _ghostPeakLine   = CreateLine("GhostPeak",      0.020f, new Color(0.3f, 0.8f, 1.0f, 0.25f),   2);
+        _carriageLine    = CreateLine("Carriage",       0.030f, new Color(0.75f, 0.80f, 0.90f, 0.9f), 3);
+        _skiBoardLine    = CreateLine("SkiBoard",       0.045f, new Color(0.90f, 0.95f, 1.00f, 1.0f), 4);
+        _legLine         = CreateLine("LegSegment",     0.065f, Color.cyan,                           5);
+        _trunkLine       = CreateLine("TrunkSegment",   0.075f, new Color(0.9f, 0.9f, 0.95f, 1.0f),   6);
+        _hipJointCircle  = CreateLine("HipJoint",       0.025f, new Color(1.0f, 0.8f, 0.2f, 1.0f),    7);
+        _headCircle      = CreateLine("HeadCircle",     0.030f, new Color(1.0f, 0.85f, 0.7f, 1.0f),   7);
+        _twoComDistLine  = CreateLine("TwoCoMLine",     0.015f, new Color(1.0f, 1.0f, 1.0f, 0.45f),   8);
+        _comLine         = CreateLine("CoMLine",        0.015f, new Color(1.0f, 0.95f, 0.2f, 0.45f),  8);
+        _lowerComCircle  = CreateLine("LowerCoMCircle", 0.025f, new Color(0.0f, 0.90f, 1.0f, 1.0f),   9);
+        _upperComCircle  = CreateLine("UpperCoMCircle", 0.042f, new Color(1.0f, 0.20f, 0.50f, 1.0f),  9);
+        _comCircle       = CreateLine("CoMCircle",      0.025f, new Color(1.0f, 0.92f, 0.15f, 1.0f),  10);
+        _forceLine       = CreateLine("ForceVector",    0.040f, Color.green,                          11);
 
-        // 操り人形（頂点誘導）ガイド線とターゲットリング
-        _puppetStringLine = CreateLineChild("PuppetStringLine", 0.014f, new Color(1.0f, 0.85f, 0.45f, 0.55f), 12);
-        _apexTargetCircle = CreateLineChild("ApexTargetCircle", 0.016f, new Color(0.45f, 1.0f, 0.75f, 0.65f), 12);
-
-        // マウスカーソル位置マーカー
-        _mouseCursorCircle = CreateLineChild("MouseCursor", 0.018f, new Color(1.0f, 0.92f, 0.35f, 0.75f), 13);
+        _puppetStringLine  = CreateLine("PuppetStringLine", 0.014f, new Color(1.0f, 0.85f, 0.45f, 0.55f), 12);
+        _apexTargetCircle  = CreateLine("ApexTargetCircle", 0.016f, new Color(0.45f, 1.0f, 0.75f, 0.65f), 12);
+        _mouseCursorCircle = CreateLine("MouseCursor",      0.018f, new Color(1.0f, 0.92f, 0.35f, 0.75f), 13);
     }
 
-    private LineRenderer CreateLineChild(string objName, float width, Color color, int sortingOrder)
+    private LineRenderer CreateLine(string objName, float width, Color color, int sortingOrder)
     {
         GameObject child = new GameObject($"_Vis_{objName}");
         child.transform.SetParent(transform, false);
@@ -187,301 +122,146 @@ public class SkyTechVisualizer : MonoBehaviour
         LineRenderer lr = child.AddComponent<LineRenderer>();
         lr.material = _lineMaterial;
         lr.useWorldSpace = true;
-        lr.startWidth = width;
-        lr.endWidth = width;
-        lr.startColor = color;
-        lr.endColor = color;
+        lr.startWidth = lr.endWidth = width;
+        lr.startColor = lr.endColor = color;
         lr.sortingLayerName = "Default";
         lr.sortingOrder = 100 + sortingOrder;
-        lr.numCapVertices = 4;
-        lr.numCornerVertices = 4;
+        lr.numCapVertices = lr.numCornerVertices = 4;
         return lr;
     }
 
+    private static void SetLine(LineRenderer lr, Vector3 a, Vector3 b)
+    {
+        lr.positionCount = 2;
+        lr.SetPosition(0, a);
+        lr.SetPosition(1, b);
+    }
+
+    private static void SetColor(LineRenderer lr, Color c) => lr.startColor = lr.endColor = c;
+
     private void UpdateRailGeometry()
     {
-        SkyTechSimConfig cfg = _controller.Config;
-        float halfRail = cfg != null ? cfg.W_rail * 0.5f : 3.60f;
-
-        _railLine.positionCount = 2;
-        _railLine.SetPosition(0, new Vector3(-halfRail, 0f, 0f));
-        _railLine.SetPosition(1, new Vector3( halfRail, 0f, 0f));
-
+        float halfRail = _controller.Config != null ? _controller.Config.W_rail * 0.5f : 3.60f;
+        SetLine(_railLine, new Vector3(-halfRail, 0f, 0f), new Vector3(halfRail, 0f, 0f));
         SetBoxPositions(_absorberLeft, new Vector3(-halfRail - 0.05f, 0f, 0f), new Vector2(0.10f, 0.14f));
         SetBoxPositions(_absorberRight, new Vector3(halfRail + 0.05f, 0f, 0f), new Vector2(0.10f, 0.14f));
     }
 
-    private void UpdateCenterCrosshairGeometry(in SimState state, in SimInput input)
+    private void UpdateCenterCrosshairGeometry(in SimInput input)
     {
-        if (!ShowCenterCrosshair)
+        Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
+        if (!ShowCenterCrosshair || cam == null)
         {
-            _centerHorizLine.positionCount = 0;
-            _centerVertLine.positionCount = 0;
-            _centerReticleCircle.positionCount = 0;
-            _heightMaxTickLine.positionCount = 0;
-            _heightMinTickLine.positionCount = 0;
-            _mouseGuideLine.positionCount = 0;
-            _mouseCursorCircle.positionCount = 0;
+            _centerHorizLine.positionCount = _leanInThresholdLine.positionCount = _centerVertLine.positionCount = 0;
+            _centerReticleCircle.positionCount = _heightMaxTickLine.positionCount = _heightMinTickLine.positionCount = 0;
+            _mouseGuideLine.positionCount = _mouseCursorCircle.positionCount = 0;
             return;
         }
 
-        Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
-        if (cam == null) return;
-
-        float depth = -cam.transform.position.z;
-        Vector3 centerScreen = new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, depth);
-        Vector3 centerWorld3 = cam.ScreenToWorldPoint(centerScreen);
+        Vector3 centerWorld3 = cam.ScreenToWorldPoint(new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, -cam.transform.position.z));
         Vector2 centerWorld = new Vector2(centerWorld3.x, centerWorld3.y + _controller.MouseCenterOffsetY);
 
         float orthoH = cam.orthographic ? cam.orthographicSize : 2.2f;
         float aspect = (cam.pixelWidth > 0 && cam.pixelHeight > 0) ? (float)cam.pixelWidth / cam.pixelHeight : (16f / 9f);
         float orthoW = orthoH * aspect;
 
-        // 1. 画面中央の水平基準線（高さの基準 = 標準スタンス l_hold）
-        _centerHorizLine.positionCount = 2;
-        _centerHorizLine.SetPosition(0, new Vector3(centerWorld.x - orthoW * 0.95f, centerWorld.y, 0f));
-        _centerHorizLine.SetPosition(1, new Vector3(centerWorld.x + orthoW * 0.95f, centerWorld.y, 0f));
+        SetLine(_centerHorizLine, new Vector3(centerWorld.x - orthoW * 0.95f, centerWorld.y, 0f), new Vector3(centerWorld.x + orthoW * 0.95f, centerWorld.y, 0f));
 
-        // 2. 画面中央の垂直基準線（左右頂点誘導・側屈中立の基準 = x_center）
-        _centerVertLine.positionCount = 2;
-        _centerVertLine.SetPosition(0, new Vector3(centerWorld.x, centerWorld.y - orthoH * 0.95f, 0f));
-        _centerVertLine.SetPosition(1, new Vector3(centerWorld.x, centerWorld.y + orthoH * 0.95f, 0f));
+        float leanInY = centerWorld.y + Mathf.Max(0.02f, _controller.MouseLeanInLineOffsetY);
+        SetLine(_leanInThresholdLine, new Vector3(centerWorld.x - orthoW * 0.95f, leanInY, 0f), new Vector3(centerWorld.x + orthoW * 0.95f, leanInY, 0f));
+        SetColor(_leanInThresholdLine, Color.Lerp(new Color(1.00f, 0.45f, 0.75f, 0.28f), new Color(1.00f, 0.30f, 0.65f, 0.85f), input.mouse_lean_in_norm));
 
-        float steerMag = Mathf.Abs(input.phi_steer_cmd);
-        Color vertCol = Color.Lerp(
-            new Color(0.55f, 0.75f, 0.95f, 0.28f),
-            new Color(0.40f, 0.90f, 1.00f, 0.50f),
-            steerMag
-        );
-        _centerVertLine.startColor = vertCol;
-        _centerVertLine.endColor = vertCol;
+        SetLine(_centerVertLine, new Vector3(centerWorld.x, centerWorld.y - orthoH * 0.95f, 0f), new Vector3(centerWorld.x, centerWorld.y + orthoH * 0.95f, 0f));
+        SetColor(_centerVertLine, Color.Lerp(new Color(0.55f, 0.75f, 0.95f, 0.28f), new Color(0.40f, 0.90f, 1.00f, 0.50f), Mathf.Abs(input.phi_steer_cmd)));
 
-        // 3. 画面中央レティクル（原点リング）
         SetCirclePositions(_centerReticleCircle, new Vector3(centerWorld.x, centerWorld.y, 0f), 0.055f, 20);
 
-        // 4. 上下の最大伸長(l_max)・最小屈曲(l_min)目盛りライン
-        float tickHalfWidth = 0.28f;
+        float tickHalfW = 0.28f;
         float upY = centerWorld.y + Mathf.Max(0.05f, GuideExtendUpRange);
         float downY = centerWorld.y - Mathf.Max(0.05f, GuideFlexDownRange);
 
-        _heightMaxTickLine.positionCount = 2;
-        _heightMaxTickLine.SetPosition(0, new Vector3(centerWorld.x - tickHalfWidth, upY, 0f));
-        _heightMaxTickLine.SetPosition(1, new Vector3(centerWorld.x + tickHalfWidth, upY, 0f));
-        Color maxTickCol = Color.Lerp(
-            new Color(0.35f, 0.95f, 0.60f, 0.30f),
-            new Color(0.35f, 1.00f, 0.55f, 0.85f),
-            input.u_ext_norm
-        );
-        _heightMaxTickLine.startColor = maxTickCol;
-        _heightMaxTickLine.endColor = maxTickCol;
+        SetLine(_heightMaxTickLine, new Vector3(centerWorld.x - tickHalfW, upY, 0f), new Vector3(centerWorld.x + tickHalfW, upY, 0f));
+        SetColor(_heightMaxTickLine, Color.Lerp(new Color(0.35f, 0.95f, 0.60f, 0.30f), new Color(0.35f, 1.00f, 0.55f, 0.85f), input.u_ext_norm));
 
-        _heightMinTickLine.positionCount = 2;
-        _heightMinTickLine.SetPosition(0, new Vector3(centerWorld.x - tickHalfWidth, downY, 0f));
-        _heightMinTickLine.SetPosition(1, new Vector3(centerWorld.x + tickHalfWidth, downY, 0f));
-        Color minTickCol = Color.Lerp(
-            new Color(0.35f, 0.75f, 1.00f, 0.30f),
-            new Color(0.30f, 0.85f, 1.00f, 0.85f),
-            input.u_flex_norm
-        );
-        _heightMinTickLine.startColor = minTickCol;
-        _heightMinTickLine.endColor = minTickCol;
+        SetLine(_heightMinTickLine, new Vector3(centerWorld.x - tickHalfW, downY, 0f), new Vector3(centerWorld.x + tickHalfW, downY, 0f));
+        SetColor(_heightMinTickLine, Color.Lerp(new Color(1.00f, 0.60f, 0.25f, 0.30f), new Color(1.00f, 0.55f, 0.15f, 0.90f), input.mouse_lean_out_norm));
 
-        // 5. マウスカーソル位置と画面中央からのオフセットガイド線
-        if (_controller.UseMouseControl && TryGetMouseWorldPosForVis(cam, out Vector2 mouseWorld))
+        if (input.has_mouse_world)
         {
-            Vector3 mPos3 = new Vector3(mouseWorld.x, mouseWorld.y, 0f);
+            Vector2 mw = input.mouse_world;
+            Vector3 mPos3 = new Vector3(mw.x, mw.y, 0f);
             SetCirclePositions(_mouseCursorCircle, mPos3, 0.042f, 16);
 
             _mouseGuideLine.positionCount = 3;
             _mouseGuideLine.SetPosition(0, new Vector3(centerWorld.x, centerWorld.y, 0f));
-            _mouseGuideLine.SetPosition(1, new Vector3(mouseWorld.x, centerWorld.y, 0f));
+            _mouseGuideLine.SetPosition(1, new Vector3(mw.x, centerWorld.y, 0f));
             _mouseGuideLine.SetPosition(2, mPos3);
 
-            bool isRight = (mouseWorld.x - centerWorld.x) > _controller.MouseLineDeadzone;
-            bool isLeft = (mouseWorld.x - centerWorld.x) < -_controller.MouseLineDeadzone;
-            Color cursorCol = isRight
+            float dx = mw.x - centerWorld.x;
+            Color cursorCol = dx > _controller.MouseLineDeadzone
                 ? new Color(0.35f, 0.90f, 1.00f, 0.80f)
-                : (isLeft ? new Color(1.00f, 0.65f, 0.25f, 0.80f) : new Color(0.85f, 0.90f, 0.95f, 0.65f));
-            _mouseCursorCircle.startColor = cursorCol;
-            _mouseCursorCircle.endColor = cursorCol;
+                : (dx < -_controller.MouseLineDeadzone ? new Color(1.00f, 0.65f, 0.25f, 0.80f) : new Color(0.85f, 0.90f, 0.95f, 0.65f));
+            SetColor(_mouseCursorCircle, cursorCol);
         }
         else
         {
-            _mouseGuideLine.positionCount = 0;
-            _mouseCursorCircle.positionCount = 0;
+            _mouseGuideLine.positionCount = _mouseCursorCircle.positionCount = 0;
         }
-    }
-
-    private static bool TryGetMouseWorldPosForVis(Camera cam, out Vector2 worldPos)
-    {
-        worldPos = Vector2.zero;
-        if (cam == null) return false;
-
-        Vector3 screenPos = Vector3.zero;
-        bool hasPos = false;
-
-        try
-        {
-            Vector3 legacyPos = Input.mousePosition;
-            if (!float.IsNaN(legacyPos.x) && !float.IsNaN(legacyPos.y))
-            {
-                screenPos = legacyPos;
-                hasPos = true;
-            }
-        }
-        catch
-        {
-            hasPos = false;
-        }
-
-#if ENABLE_INPUT_SYSTEM
-        if (!hasPos)
-        {
-            var pointer = (Pointer.current != null) ? Pointer.current : (Pointer)Mouse.current;
-            if (pointer != null)
-            {
-                Vector2 mp = pointer.position.ReadValue();
-                if (!float.IsNaN(mp.x) && !float.IsNaN(mp.y))
-                {
-                    screenPos = new Vector3(mp.x, mp.y, 0f);
-                    hasPos = true;
-
-#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
-                    float retinaFactor = 1.0f;
-#if UNITY_EDITOR
-                    retinaFactor = UnityEditor.EditorGUIUtility.pixelsPerPoint;
-#else
-                    if (Display.main.systemWidth > 0 && Display.main.renderingWidth > 0)
-                    {
-                        retinaFactor = (float)Display.main.renderingWidth / Display.main.systemWidth;
-                    }
-                    else if (Screen.dpi > 160f)
-                    {
-                        retinaFactor = 2.0f;
-                    }
-#endif
-                    if (retinaFactor > 1.05f)
-                    {
-                        if (screenPos.x * retinaFactor <= cam.pixelWidth * 1.05f &&
-                            screenPos.y * retinaFactor <= cam.pixelHeight * 1.05f)
-                        {
-                            screenPos.x *= retinaFactor;
-                            screenPos.y *= retinaFactor;
-                        }
-                    }
-#endif
-                }
-            }
-        }
-#endif
-
-        if (!hasPos) return false;
-
-        screenPos.z = -cam.transform.position.z;
-        Vector3 wp = cam.ScreenToWorldPoint(screenPos);
-        worldPos = new Vector2(wp.x, wp.y);
-        return true;
     }
 
     private void UpdateDynamicGeometry(in SimState state, in SimInput input, SkyTechSimConfig cfg)
     {
         Vector3 P = new Vector3(state.x_c, 0f, 0f);
-
         SetBoxPositions(_carriageLine, P + new Vector3(0f, -0.03f, 0f), new Vector2(0.24f, 0.06f));
 
         Vector3 skiTangent = new Vector3(Mathf.Cos(state.theta1), -Mathf.Sin(state.theta1), 0f);
-        _skiBoardLine.positionCount = 2;
-        _skiBoardLine.SetPosition(0, P - skiTangent * 0.16f);
-        _skiBoardLine.SetPosition(1, P + skiTangent * 0.16f);
+        SetLine(_skiBoardLine, P - skiTangent * 0.16f, P + skiTangent * 0.16f);
 
-        float sinTheta1 = Mathf.Sin(state.theta1);
-        float cosTheta1 = Mathf.Cos(state.theta1);
-        Vector3 H = P + new Vector3(state.l1 * sinTheta1, state.l1 * cosTheta1, 0f);
+        float sin1 = Mathf.Sin(state.theta1), cos1 = Mathf.Cos(state.theta1);
+        Vector3 H = P + new Vector3(state.l1 * sin1, state.l1 * cos1, 0f);
 
-        _legLine.positionCount = 2;
-        _legLine.SetPosition(0, P);
-        _legLine.SetPosition(1, H);
-
-        Color legColor = Color.Lerp(new Color(0.2f, 0.85f, 1.0f, 1f), new Color(1.0f, 0.45f, 0.1f, 1f), input.u_ext_norm);
-        _legLine.startColor = legColor;
-        _legLine.endColor = legColor;
-
+        SetLine(_legLine, P, H);
+        SetColor(_legLine, Color.Lerp(new Color(0.2f, 0.85f, 1.0f, 1f), new Color(1.0f, 0.45f, 0.1f, 1f), input.u_ext_norm));
         SetCirclePositions(_hipJointCircle, H, 0.040f, 16);
 
         float theta2 = state.theta1 - state.phi;
-        float sinTheta2 = Mathf.Sin(theta2);
-        float cosTheta2 = Mathf.Cos(theta2);
-        Vector3 trunkVec = new Vector3(sinTheta2, cosTheta2, 0f);
+        Vector3 trunkVec = new Vector3(Mathf.Sin(theta2), Mathf.Cos(theta2), 0f);
         Vector3 U = H + trunkVec * cfg.l2;
         Vector3 HeadPos = H + trunkVec * (cfg.l2 * 1.55f);
 
-        _trunkLine.positionCount = 2;
-        _trunkLine.SetPosition(0, H);
-        _trunkLine.SetPosition(1, U);
-
+        SetLine(_trunkLine, H, U);
         SetCirclePositions(_headCircle, HeadPos, 0.075f, 20);
 
-        // 操り人形（頂点誘導）ガイドの描画（物理挙動には一切力を加えない純粋な視覚ガイド）
-        UpdatePuppetApexGuide(P, HeadPos, state, input, cfg);
+        UpdatePuppetApexGuide(H, HeadPos, state, input, cfg);
 
-        Vector3 CoM1 = P + new Vector3(cfg.c1 * state.l1 * sinTheta1, cfg.c1 * state.l1 * cosTheta1, 0f);
+        Vector3 CoM1 = P + new Vector3(cfg.c1 * state.l1 * sin1, cfg.c1 * state.l1 * cos1, 0f);
         SetCirclePositions(_lowerComCircle, CoM1, 0.040f, 16);
-
-        Vector3 CoM2 = H + trunkVec * cfg.l2;
-        SetCirclePositions(_upperComCircle, CoM2, 0.042f, 16);
-
-        _twoComDistLine.positionCount = 2;
-        _twoComDistLine.SetPosition(0, CoM1);
-        _twoComDistLine.SetPosition(1, CoM2);
+        SetCirclePositions(_upperComCircle, U, 0.042f, 16);
+        SetLine(_twoComDistLine, CoM1, U);
 
         Vector3 C = P + new Vector3(state.y_CoM, state.z_CoM, 0f);
         SetCirclePositions(_comCircle, C, 0.048f, 18);
+        SetLine(_comLine, P, C);
 
-        _comLine.positionCount = 2;
-        _comLine.SetPosition(0, P);
-        _comLine.SetPosition(1, C);
-
-        Vector3 legAxis = new Vector3(sinTheta1, cosTheta1, 0f);
         float mg = cfg.M * cfg.g;
-        float forceScale = 0.35f;
-        float forceLen = (mg > 0.001f) ? (state.F_leg / mg) * forceScale : 0f;
+        float forceLen = (mg > 0.001f) ? (state.F_leg / mg) * 0.35f : 0f;
+        SetLine(_forceLine, P, P + new Vector3(sin1, cos1, 0f) * forceLen);
 
-        Vector3 forceEnd = P + legAxis * forceLen;
-        _forceLine.positionCount = 2;
-        _forceLine.SetPosition(0, P);
-        _forceLine.SetPosition(1, forceEnd);
-
-        Color forceColor;
-        switch (state.gripState)
+        SetColor(_forceLine, state.gripState switch
         {
-            case SkiGripState.Carving:
-                forceColor = new Color(0.2f, 0.95f, 0.3f, 1f);
-                break;
-            case SkiGripState.Unweighted:
-                forceColor = new Color(1.0f, 0.85f, 0.2f, 1f);
-                break;
-            case SkiGripState.Skidding:
-                forceColor = new Color(1.0f, 0.25f, 0.25f, 1f);
-                break;
-            case SkiGripState.RailLimitHit:
-                forceColor = new Color(1.0f, 0.55f, 0.1f, 1f);
-                break;
-            default:
-                forceColor = new Color(0.9f, 0.2f, 0.95f, 1f);
-                break;
-        }
-        _forceLine.startColor = forceColor;
-        _forceLine.endColor = forceColor;
+            SkiGripState.Carving => new Color(0.2f, 0.95f, 0.3f, 1f),
+            SkiGripState.Unweighted => new Color(1.0f, 0.85f, 0.2f, 1f),
+            SkiGripState.Skidding => new Color(1.0f, 0.25f, 0.25f, 1f),
+            SkiGripState.RailLimitHit => new Color(1.0f, 0.55f, 0.1f, 1f),
+            _ => new Color(0.9f, 0.2f, 0.95f, 1f)
+        });
 
         float peakRad = _controller.CurrentTurnPeakEdgeDeg * Mathf.Deg2Rad;
         if (peakRad > 0.05f)
         {
             float sign = Mathf.Sign(state.theta1);
             if (sign == 0f) sign = 1f;
-            Vector3 ghostDir = new Vector3(Mathf.Sin(peakRad * sign), Mathf.Cos(peakRad * sign), 0f);
-            _ghostPeakLine.positionCount = 2;
-            _ghostPeakLine.SetPosition(0, P);
-            _ghostPeakLine.SetPosition(1, P + ghostDir * 0.85f);
+            SetLine(_ghostPeakLine, P, P + new Vector3(Mathf.Sin(peakRad * sign), Mathf.Cos(peakRad * sign), 0f) * 0.85f);
         }
         else
         {
@@ -489,56 +269,29 @@ public class SkyTechVisualizer : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// マウス入力に基づく「目標頭頂位置（Apex Target）」と実際の頭頂（HeadPos）を結ぶ操り糸ガイドを更新します。
-    /// ※視覚表示のみであり、物理ソルバーの運動方程式には一切影響を与えません。
-    /// </summary>
-    private void UpdatePuppetApexGuide(Vector3 footPos, Vector3 headPos, in SimState state, in SimInput input, SkyTechSimConfig cfg)
+    private void UpdatePuppetApexGuide(Vector3 hipPos, Vector3 headPos, in SimState state, in SimInput input, SkyTechSimConfig cfg)
     {
-        if (!ShowPuppetApexGuide || !_controller.UseMouseControl)
+        if (!ShowPuppetApexGuide || !input.has_mouse_world)
         {
-            _puppetStringLine.positionCount = 0;
-            _apexTargetCircle.positionCount = 0;
+            _puppetStringLine.positionCount = _apexTargetCircle.positionCount = 0;
             return;
         }
 
-        Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
-        if (cam == null || !TryGetMouseWorldPosForVis(cam, out Vector2 mouseWorld))
-        {
-            _puppetStringLine.positionCount = 0;
-            _apexTargetCircle.positionCount = 0;
-            return;
-        }
-
-        // 現在の目標上体角(state.theta2_ref)に基づく目標頭頂位置を算出
-        float sinTheta1 = Mathf.Sin(state.theta1);
-        float cosTheta1 = Mathf.Cos(state.theta1);
-        Vector3 hipPos = footPos + new Vector3(state.l1 * sinTheta1, state.l1 * cosTheta1, 0f);
-
-        float headReach = cfg.l2 * 1.55f;
         Vector3 targetTrunkDir = new Vector3(Mathf.Sin(state.theta2_ref), Mathf.Cos(state.theta2_ref), 0f);
-        Vector3 apexTargetPos = hipPos + targetTrunkDir * headReach;
-
+        Vector3 apexTargetPos = hipPos + targetTrunkDir * (cfg.l2 * 1.55f);
         SetCirclePositions(_apexTargetCircle, apexTargetPos, 0.052f, 18);
 
-        // 頭頂(HeadPos) → 足元基準の目標頂点(apexTargetPos) → マウスカーソル(mouseWorld) を結ぶ操り糸ガイド
-        Vector3 mousePos3 = new Vector3(mouseWorld.x, mouseWorld.y, 0f);
         _puppetStringLine.positionCount = 3;
         _puppetStringLine.SetPosition(0, headPos);
         _puppetStringLine.SetPosition(1, apexTargetPos);
-        _puppetStringLine.SetPosition(2, mousePos3);
+        _puppetStringLine.SetPosition(2, new Vector3(input.mouse_world.x, input.mouse_world.y, 0f));
 
-        // 中央戻し（側屈伸展＋脚プッシュ）時はエメラルドグリーン、左右誘導時はゴールドに変化
-        Color stringCol = Color.Lerp(
-            new Color(1.0f, 0.85f, 0.40f, 0.50f),
-            new Color(0.30f, 1.0f, 0.65f, 0.80f),
-            input.u_ext_norm
-        );
+        Color stringCol = Color.Lerp(new Color(1.0f, 0.85f, 0.40f, 0.50f), new Color(0.30f, 1.0f, 0.65f, 0.80f), input.u_ext_norm);
         _puppetStringLine.startColor = stringCol;
         _puppetStringLine.endColor = new Color(stringCol.r, stringCol.g, stringCol.b, 0.25f);
     }
 
-    private void SetCirclePositions(LineRenderer lr, Vector3 center, float radius, int segments)
+    private static void SetCirclePositions(LineRenderer lr, Vector3 center, float radius, int segments)
     {
         lr.positionCount = segments + 1;
         float deltaAngle = (Mathf.PI * 2f) / segments;
@@ -549,11 +302,10 @@ public class SkyTechVisualizer : MonoBehaviour
         }
     }
 
-    private void SetBoxPositions(LineRenderer lr, Vector3 center, Vector2 size)
+    private static void SetBoxPositions(LineRenderer lr, Vector3 center, Vector2 size)
     {
         lr.positionCount = 5;
-        float hx = size.x * 0.5f;
-        float hy = size.y * 0.5f;
+        float hx = size.x * 0.5f, hy = size.y * 0.5f;
         lr.SetPosition(0, center + new Vector3(-hx, -hy, 0f));
         lr.SetPosition(1, center + new Vector3( hx, -hy, 0f));
         lr.SetPosition(2, center + new Vector3( hx,  hy, 0f));
@@ -570,76 +322,24 @@ public class SkyTechVisualizer : MonoBehaviour
         _barFillTex = CreateSolidTexture(new Color(0.20f, 0.75f, 0.95f, 1.00f));
         _badgeTex   = CreateSolidTexture(Color.white);
 
-        _panelStyle = new GUIStyle(GUI.skin.box)
-        {
-            normal = { background = _panelBgTex },
-            padding = new RectOffset(12, 12, 10, 10)
-        };
-
-        _titleStyle = new GUIStyle(GUI.skin.label)
-        {
-            fontSize = 13,
-            fontStyle = FontStyle.Bold,
-            normal = { textColor = new Color(0.4f, 0.85f, 1.0f) },
-            alignment = TextAnchor.MiddleLeft
-        };
-
-        _labelStyle = new GUIStyle(GUI.skin.label)
-        {
-            fontSize = 11,
-            normal = { textColor = new Color(0.80f, 0.85f, 0.92f) },
-            alignment = TextAnchor.MiddleLeft,
-            richText = true
-        };
-
-        _valueStyle = new GUIStyle(GUI.skin.label)
-        {
-            fontSize = 11,
-            fontStyle = FontStyle.Bold,
-            normal = { textColor = Color.white },
-            alignment = TextAnchor.MiddleRight,
-            richText = true
-        };
-
-        _badgeStyle = new GUIStyle(GUI.skin.box)
-        {
-            fontSize = 12,
-            fontStyle = FontStyle.Bold,
-            alignment = TextAnchor.MiddleCenter,
-            normal = { background = _badgeTex, textColor = Color.white }
-        };
-
-        _guideStyle = new GUIStyle(GUI.skin.label)
-        {
-            fontSize = 11,
-            normal = { textColor = new Color(0.75f, 0.82f, 0.90f) },
-            alignment = TextAnchor.MiddleCenter,
-            richText = true
-        };
-
-        _centerTagStyle = new GUIStyle(GUI.skin.label)
-        {
-            fontSize = 10,
-            normal = { textColor = new Color(0.65f, 0.82f, 0.98f, 0.65f) },
-            alignment = TextAnchor.MiddleLeft,
-            richText = true
-        };
+        _panelStyle     = new GUIStyle(GUI.skin.box) { normal = { background = _panelBgTex }, padding = new RectOffset(12, 12, 10, 10) };
+        _titleStyle     = new GUIStyle(GUI.skin.label) { fontSize = 13, fontStyle = FontStyle.Bold, normal = { textColor = new Color(0.4f, 0.85f, 1.0f) }, alignment = TextAnchor.MiddleLeft };
+        _labelStyle     = new GUIStyle(GUI.skin.label) { fontSize = 11, normal = { textColor = new Color(0.80f, 0.85f, 0.92f) }, alignment = TextAnchor.MiddleLeft, richText = true };
+        _valueStyle     = new GUIStyle(GUI.skin.label) { fontSize = 11, fontStyle = FontStyle.Bold, normal = { textColor = Color.white }, alignment = TextAnchor.MiddleRight, richText = true };
+        _badgeStyle     = new GUIStyle(GUI.skin.box) { fontSize = 12, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter, normal = { background = _badgeTex, textColor = Color.white } };
+        _guideStyle     = new GUIStyle(GUI.skin.label) { fontSize = 11, normal = { textColor = new Color(0.75f, 0.82f, 0.90f) }, alignment = TextAnchor.MiddleCenter, richText = true };
+        _centerTagStyle = new GUIStyle(GUI.skin.label) { fontSize = 10, normal = { textColor = new Color(0.65f, 0.82f, 0.98f, 0.65f) }, alignment = TextAnchor.MiddleLeft, richText = true };
 
         _guiInitialized = true;
     }
 
     private void OnGUI()
     {
-        if (_controller == null) return;
-
+        if (_controller == null || _controller.Config == null) return;
         InitGUIStyles();
 
-        SimState state = _controller.CurrentState;
-        SkyTechSimConfig cfg = _controller.Config;
-        if (cfg == null) return;
-
         DrawCenterGuideLabels();
-        DrawBiomechanicsPanel(state, cfg);
+        DrawBiomechanicsPanel(_controller.CurrentState, _controller.Config);
         DrawScorePanel();
         DrawControlsGuidePanel();
     }
@@ -649,18 +349,22 @@ public class SkyTechVisualizer : MonoBehaviour
         if (!ShowCenterCrosshair) return;
 
         Camera cam = Camera.main;
-        float cx = Screen.width * 0.5f;
-        float cy = Screen.height * 0.5f;
-        if (cam != null && _controller != null)
+        float cx = Screen.width * 0.5f, cy = Screen.height * 0.5f, leanInScreenY = cy - 45f;
+
+        if (cam != null)
         {
             Vector3 wp = cam.ScreenToWorldPoint(new Vector3(cx, cy, -cam.transform.position.z));
             wp.y += _controller.MouseCenterOffsetY;
             cy = Screen.height - cam.WorldToScreenPoint(wp).y;
+
+            wp.y += Mathf.Max(0.02f, _controller.MouseLeanInLineOffsetY);
+            leanInScreenY = Screen.height - cam.WorldToScreenPoint(wp).y;
         }
 
-        GUI.Label(new Rect(cx + 10f, cy - 18f, 230f, 18f), "CENTER (側屈伸展・上体直立 / 基準高)", _centerTagStyle);
-        GUI.Label(new Rect(cx - 140f, cy + 4f, 130f, 18f), "← 左へ頭頂誘導・側屈", _centerTagStyle);
-        GUI.Label(new Rect(cx + 10f, cy + 4f, 130f, 18f), "右へ頭頂誘導・側屈 →", _centerTagStyle);
+        GUI.Label(new Rect(cx + 10f, leanInScreenY - 18f, 260f, 18f), "<color=#FF73BF>▲ LEAN-IN LINE (これより上で手動リーンイン)</color>", _centerTagStyle);
+        GUI.Label(new Rect(cx + 10f, cy - 18f, 260f, 18f), "CENTER (中立基準線 / 基準脚長)", _centerTagStyle);
+        GUI.Label(new Rect(cx + 10f, cy + 4f, 260f, 18f), "<color=#FFA040>▼ これより下でリーンアウト (脚屈曲なし)</color>", _centerTagStyle);
+        GUI.Label(new Rect(cx - 140f, cy + 4f, 130f, 18f), "← 左へ頭頂誘導", _centerTagStyle);
     }
 
     private void DrawBiomechanicsPanel(in SimState state, SkyTechSimConfig cfg)
@@ -668,46 +372,20 @@ public class SkyTechVisualizer : MonoBehaviour
         Rect panelRect = new Rect(15, 15, 355, 480);
         GUI.Box(panelRect, GUIContent.none, _panelStyle);
 
-        float curY = panelRect.y + 10;
-        float leftX = panelRect.x + 12;
-        float contentW = panelRect.width - 24;
-
+        float curY = panelRect.y + 10, leftX = panelRect.x + 12, contentW = panelRect.width - 24;
         GUI.Label(new Rect(leftX, curY, contentW, 20), "BIOMECHANICS & TELEMETRY", _titleStyle);
         curY += 24;
 
-        Color badgeBg;
-        string badgeText;
-        switch (state.gripState)
+        (string badgeText, Color badgeBg) = state.gripState switch
         {
-            case SkiGripState.Carving:
-                badgeBg = new Color(0.15f, 0.70f, 0.35f);
-                badgeText = "GRIP: CARVING";
-                break;
-            case SkiGripState.Unweighted:
-                badgeBg = new Color(0.85f, 0.65f, 0.10f);
-                badgeText = "GRIP: UNWEIGHTED";
-                break;
-            case SkiGripState.Skidding:
-                badgeBg = new Color(0.85f, 0.20f, 0.20f);
-                badgeText = "SKIDDING (SNOW FAILURE!)";
-                break;
-            case SkiGripState.RailLimitHit:
-                badgeBg = new Color(0.90f, 0.45f, 0.10f);
-                badgeText = "STATUS: RAIL LIMIT HIT";
-                break;
-            case SkiGripState.BootOut:
-                badgeBg = new Color(0.65f, 0.15f, 0.75f);
-                badgeText = "CRASH: BOOT OUT!";
-                break;
-            case SkiGripState.HipCrash:
-                badgeBg = new Color(0.75f, 0.10f, 0.20f);
-                badgeText = "CRASH: HIP DOWN!";
-                break;
-            default:
-                badgeBg = Color.gray;
-                badgeText = state.gripState.ToString();
-                break;
-        }
+            SkiGripState.Carving      => ("GRIP: CARVING",            new Color(0.15f, 0.70f, 0.35f)),
+            SkiGripState.Unweighted   => ("GRIP: UNWEIGHTED",         new Color(0.85f, 0.65f, 0.10f)),
+            SkiGripState.Skidding     => ("SKIDDING (SNOW FAILURE!)", new Color(0.85f, 0.20f, 0.20f)),
+            SkiGripState.RailLimitHit => ("STATUS: RAIL LIMIT HIT",   new Color(0.90f, 0.45f, 0.10f)),
+            SkiGripState.BootOut      => ("CRASH: BOOT OUT!",         new Color(0.65f, 0.15f, 0.75f)),
+            SkiGripState.HipCrash     => ("CRASH: HIP DOWN!",         new Color(0.75f, 0.10f, 0.20f)),
+            _                         => (state.gripState.ToString(), Color.gray)
+        };
 
         DrawBadge(new Rect(leftX, curY, contentW, 22), badgeText, badgeBg, Color.white);
         curY += 28;
@@ -719,14 +397,12 @@ public class SkyTechVisualizer : MonoBehaviour
 
         float edgeDeg = Mathf.Abs(state.theta1) * Mathf.Rad2Deg;
         float comDeg = Mathf.Abs(state.Psi_CoM) * Mathf.Rad2Deg;
-        float targetDeg = _controller.TargetLegRollDeg;
-        DrawMetricRow(leftX, ref curY, contentW, "Edge θ1 vs <color=#FFEB3B>CoM</color> Ψ", $"{state.theta1 * Mathf.Rad2Deg:+0.0;-0.0;0.0}° [目標: {targetDeg:+0;-0;0}°] / {comDeg:F1}°");
+        DrawMetricRow(leftX, ref curY, contentW, "Edge θ1 vs <color=#FFEB3B>CoM</color> Ψ", $"{state.theta1 * Mathf.Rad2Deg:+0.0;-0.0;0.0}° [目標: {_controller.TargetLegRollDeg:+0;-0;0}°] / {comDeg:F1}°");
         DrawProgressBar(new Rect(leftX, curY, contentW, 10), edgeDeg / 78.0f, new Color(0.2f, 0.8f, 1f));
         curY += 16;
 
-        float phiDeg = state.phi * Mathf.Rad2Deg;
         string shiftInfo = (Mathf.Abs(state.dy_actual) > 0.005f) ? $" [Δy:{state.dy_actual * 100f:+0.0;-0.0;0.0}cm]" : "";
-        DrawMetricRow(leftX, ref curY, contentW, "Hip φ / CoM Shift", $"{phiDeg:F1}° (±{cfg.phi_out_maxDeg:F0}°){shiftInfo}");
+        DrawMetricRow(leftX, ref curY, contentW, "Hip φ / CoM Shift", $"{state.phi * Mathf.Rad2Deg:F1}° (±{cfg.phi_out_maxDeg:F0}°){shiftInfo}");
         curY += 2;
 
         string zoneLabel = (state.s_rom >= 0.68f && state.s_rom <= 0.88f)
@@ -740,22 +416,18 @@ public class SkyTechVisualizer : MonoBehaviour
         curY += 2;
 
         float mg = cfg.M * cfg.g;
-        float fLegG = (mg > 0.001f) ? (state.F_leg / mg) : 0f;
-        float fVertG = (mg > 0.001f) ? (state.F_vert / mg) : 0f;
-        DrawMetricRow(leftX, ref curY, contentW, "Load: F_leg / F_vert", $"{fLegG:F2} G / 鉛直:{fVertG:F2} G (ストレス:{state.snow_stress_ratio * 100f:F0}%)");
+        float invMg = (mg > 0.001f) ? (1f / mg) : 0f;
+        DrawMetricRow(leftX, ref curY, contentW, "Load: F_leg / F_vert", $"{state.F_leg * invMg:F2} G / 鉛直:{state.F_vert * invMg:F2} G (ストレス:{state.snow_stress_ratio * 100f:F0}%)");
         curY += 2;
 
         float realLatG = (cfg.g > 0.001f) ? (Mathf.Abs(state.a_c) / cfg.g) : 0f;
         DrawMetricRow(leftX, ref curY, contentW, "Lateral G (Base / Real)", $"{Mathf.Abs(state.G_base):F2} G / {realLatG:F2} G (λ:{state.lambda_sustain * 100f:F0}%)");
         curY += 2;
 
-        float vKmh = state.V * 3.6f;
-        DrawMetricRow(leftX, ref curY, contentW, "Speed V", $"{vKmh:F1} km/h ({state.V:F1} m/s)");
+        DrawMetricRow(leftX, ref curY, contentW, "Speed V", $"{state.V * 3.6f:F1} km/h ({state.V:F1} m/s)");
         curY += 2;
 
-        float carriageKmh = state.v_c * 3.6f;
-        float targetCarriageKmh = state.v_c_target * 3.6f;
-        DrawMetricRow(leftX, ref curY, contentW, "Carriage X / Speed", $"{state.x_c:+0.00;-0.00;0.00}m ({carriageKmh:+0.0;-0.0;0.0} / 目標:{targetCarriageKmh:+0.0;-0.0;0.0}km/h)");
+        DrawMetricRow(leftX, ref curY, contentW, "Carriage X / Speed", $"{state.x_c:+0.00;-0.00;0.00}m ({state.v_c * 3.6f:+0.0;-0.0;0.0} / 目標:{state.v_c_target * 3.6f:+0.0;-0.0;0.0}km/h)");
         curY += 2;
 
         float currentR = (Mathf.Abs(state.kappa) > 0.005f) ? (1.0f / Mathf.Abs(state.kappa)) : 99.9f;
@@ -764,8 +436,7 @@ public class SkyTechVisualizer : MonoBehaviour
 
         float staminaNorm = (cfg.maxStamina > 0.001f) ? Mathf.Clamp01(state.stamina / cfg.maxStamina) : 1f;
         DrawMetricRow(leftX, ref curY, contentW, "Anaerobic Stamina", $"{state.stamina:F0} J ({staminaNorm * 100f:F0}%)");
-        Color staminaColor = staminaNorm > 0.35f ? new Color(0.3f, 0.9f, 0.4f) : new Color(0.95f, 0.3f, 0.2f);
-        DrawProgressBar(new Rect(leftX, curY, contentW, 10), staminaNorm, staminaColor);
+        DrawProgressBar(new Rect(leftX, curY, contentW, 10), staminaNorm, staminaNorm > 0.35f ? new Color(0.3f, 0.9f, 0.4f) : new Color(0.95f, 0.3f, 0.2f));
         curY += 16;
 
         string assistStr = _controller.AutoAngulationAssist ? "<color=#2ECC71>AUTO-ASSIST: ON</color>" : "<color=#BDC3C7>MANUAL (Tab)</color>";
@@ -777,78 +448,63 @@ public class SkyTechVisualizer : MonoBehaviour
         Rect panelRect = new Rect(Screen.width - 325, 15, 310, 205);
         GUI.Box(panelRect, GUIContent.none, _panelStyle);
 
-        float curY = panelRect.y + 10;
-        float leftX = panelRect.x + 12;
-        float contentW = panelRect.width - 24;
-
+        float curY = panelRect.y + 10, leftX = panelRect.x + 12, contentW = panelRect.width - 24;
         GUI.Label(new Rect(leftX, curY, contentW, 20), "TURN SCORE & COMBO", _titleStyle);
         curY += 24;
 
         DrawMetricRow(leftX, ref curY, contentW, "Total Score", $"{_controller.TotalScore:F0}");
         curY += 2;
-
         DrawMetricRow(leftX, ref curY, contentW, "Turns / Combo", $"{_controller.TurnCount} / {_controller.ComboCount}x");
         curY += 4;
-
         DrawMetricRow(leftX, ref curY, contentW, "Current Peak Edge", $"{_controller.CurrentTurnPeakEdgeDeg:F1}°");
         DrawProgressBar(new Rect(leftX, curY, contentW, 8), _controller.CurrentTurnPeakEdgeDeg / 78.0f, new Color(0.3f, 0.75f, 1f));
         curY += 14;
-
         DrawMetricRow(leftX, ref curY, contentW, "Last Turn Peak", $"{_controller.LastTurnPeakEdgeDeg:F1}°");
         curY += 4;
 
-        Color evalBg = new Color(0.20f, 0.45f, 0.75f);
-        if (_controller.LastTurnEvaluation.Contains("WORLD CUP"))
-            evalBg = new Color(0.85f, 0.55f, 0.05f);
-        else if (_controller.LastTurnEvaluation.Contains("DEEP"))
-            evalBg = new Color(0.15f, 0.65f, 0.40f);
-        else if (_controller.LastTurnEvaluation.Contains("CRASH") || _controller.LastTurnEvaluation.Contains("RAIL"))
-            evalBg = new Color(0.80f, 0.20f, 0.20f);
+        string eval = _controller.LastTurnEvaluation;
+        Color evalBg = eval.Contains("WORLD CUP") ? new Color(0.85f, 0.55f, 0.05f)
+                     : eval.Contains("DEEP")      ? new Color(0.15f, 0.65f, 0.40f)
+                     : (eval.Contains("CRASH") || eval.Contains("RAIL")) ? new Color(0.80f, 0.20f, 0.20f)
+                     : new Color(0.20f, 0.45f, 0.75f);
 
-        DrawBadge(new Rect(leftX, curY, contentW, 26), _controller.LastTurnEvaluation, evalBg, Color.white);
+        DrawBadge(new Rect(leftX, curY, contentW, 26), eval, evalBg, Color.white);
     }
 
     private void DrawControlsGuidePanel()
     {
-        float panelW = Mathf.Min(780, Screen.width - 30);
+        float panelW = Mathf.Min(820, Screen.width - 30);
         Rect panelRect = new Rect((Screen.width - panelW) * 0.5f, Screen.height - 62, panelW, 50);
         GUI.Box(panelRect, GUIContent.none, _panelStyle);
 
-        float curY = panelRect.y + 6;
-        GUI.Label(new Rect(panelRect.x, curY, panelW, 18),
-            $"<color=#F4D03F>[Q / E]</color> ロール倒れ込み(±2°: {_controller.TargetLegRollDeg:+0;-0;0}°)   |   <color=#2ECC71>[W]</color> 直立リセット   |   <color=#58D68D>[Space / ↑ / マウス中央・上戻し]</color> 側屈伸展＋脚プッシュ   |   <color=#85C1E9>[S / マウス下]</color> 屈曲",
+        GUI.Label(new Rect(panelRect.x, panelRect.y + 6, panelW, 18),
+            "<color=#FF73BF>[リーンイン線より上]</color> 手動リーンイン   |   <color=#FFA040>[中立線より下]</color> リーンアウト(脚屈曲なし)   |   <color=#58D68D>[Space / ↑ / 中立線より上]</color> 脚伸展   |   <color=#85C1E9>[S]</color> 脚屈曲",
             _guideStyle);
-
-        curY += 18;
-        GUI.Label(new Rect(panelRect.x, curY, panelW, 18),
-            "<color=#5DADE2>[マウス左右 / A・D]</color> 頭頂(頂点)誘導＆深角側屈   |   <color=#F39C12>[外側のマウスを中央へ戻す / ↓]</color> 上体の側屈を伸ばしてターン切り替え   |   <color=#E74C3C>[R]</color> リセット",
+        GUI.Label(new Rect(panelRect.x, panelRect.y + 24, panelW, 18),
+            $"<color=#5DADE2>[マウス左右 / A・D]</color> 頭頂誘導   |   <color=#F4D03F>[Q / E]</color> 股関節固定({_controller.TargetLegRollDeg:+0;-0;0}°)   |   <color=#2ECC71>[W]</color> 直立リセット   |   <color=#E74C3C>[R]</color> リセット",
             _guideStyle);
     }
 
     private void DrawMetricRow(float x, ref float y, float width, string label, string value)
     {
         float labelW = width * 0.46f;
-        float valueW = width * 0.54f;
         GUI.Label(new Rect(x, y, labelW, 18), label, _labelStyle);
-        GUI.Label(new Rect(x + labelW, y, valueW, 18), value, _valueStyle);
+        GUI.Label(new Rect(x + labelW, y, width * 0.54f, 18), value, _valueStyle);
         y += 18;
     }
 
     private void DrawProgressBar(Rect rect, float fill01, Color fillColor)
     {
         fill01 = Mathf.Clamp01(fill01);
-
         Color oldColor = GUI.color;
         GUI.color = Color.white;
         GUI.DrawTexture(rect, _barBgTex);
 
         if (fill01 > 0.005f)
         {
-            Rect fillRect = new Rect(rect.x + 1, rect.y + 1, (rect.width - 2) * fill01, rect.height - 2);
             GUI.color = fillColor;
-            GUI.DrawTexture(fillRect, _barFillTex);
+            GUI.DrawTexture(new Rect(rect.x + 1, rect.y + 1, (rect.width - 2) * fill01, rect.height - 2), _barFillTex);
         }
-
         GUI.color = oldColor;
     }
 
@@ -865,12 +521,9 @@ public class SkyTechVisualizer : MonoBehaviour
         _badgeStyle.normal.textColor = oldTextCol;
     }
 
-    private Texture2D CreateSolidTexture(Color color)
+    private static Texture2D CreateSolidTexture(Color color)
     {
-        Texture2D tex = new Texture2D(1, 1, TextureFormat.RGBA32, false)
-        {
-            hideFlags = HideFlags.DontSave
-        };
+        Texture2D tex = new Texture2D(1, 1, TextureFormat.RGBA32, false) { hideFlags = HideFlags.DontSave };
         tex.SetPixel(0, 0, color);
         tex.Apply();
         return tex;
@@ -878,10 +531,10 @@ public class SkyTechVisualizer : MonoBehaviour
 
     private void OnDestroy()
     {
-        if (_lineMaterial != null) Destroy(_lineMaterial);
-        if (_panelBgTex != null) Destroy(_panelBgTex);
-        if (_barBgTex != null) Destroy(_barBgTex);
-        if (_barFillTex != null) Destroy(_barFillTex);
-        if (_badgeTex != null) Destroy(_badgeTex);
+        Destroy(_lineMaterial);
+        Destroy(_panelBgTex);
+        Destroy(_barBgTex);
+        Destroy(_barFillTex);
+        Destroy(_badgeTex);
     }
 }

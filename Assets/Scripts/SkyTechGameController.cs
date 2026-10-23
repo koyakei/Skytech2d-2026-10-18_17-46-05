@@ -2,19 +2,18 @@ using UnityEngine;
 using SkyTechSimulator;
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.Controls;
 #endif
 
 public class SkyTechGameController : MonoBehaviour
 {
     public enum MouseHeightControlMode
     {
-        [Tooltip("画面の上下中央を基準高さ(標準スタンス)とし、上へ動かすと伸長(l_max)、下へ動かすと短縮(l_min)")]
+        [Tooltip("中立基準線を標準スタンスとし、上へ動かすと伸長(l_max)、下へ動かすと脚を曲げずにリーンアウト")]
         VerticalSignedFromCenter,
-
-        [Tooltip("画面の中心座標(X, Y)からの2D距離で制御（中心に近いほど伸長 l_max、離れるほど短縮 l_min）")]
+        [Tooltip("画面の中心座標(X, Y)からの2D距離で制御（下側は脚を屈曲させず中立長を維持）")]
         DistanceFromScreenCenter,
-
-        [Tooltip("画面の上下中央(Y)からの垂直距離 |dy| で制御（中央の高さに近いほど伸長 l_max、上下に離れるほど短縮 l_min）")]
+        [Tooltip("画面の上下中央(Y)からの垂直距離 |dy| で制御（下側は脚を屈曲させず中立長を維持）")]
         VerticalDistanceFromCenter
     }
 
@@ -24,26 +23,14 @@ public class SkyTechGameController : MonoBehaviour
     [Header("=== アシスト・マウス操作設定 ===")]
     public bool AutoAngulationAssist = false;
     public bool UseMouseControl = true;
-
-    [Tooltip("画面中央基準での高さ（脚の伸縮）制御モード")]
     public MouseHeightControlMode HeightControlMode = MouseHeightControlMode.VerticalSignedFromCenter;
-
-    [Tooltip("画面中央から上方向へ基準高さ（中間姿勢ライン）をずらすオフセット距離(m)。プラスで基準位置が高くなります")]
     public float MouseCenterOffsetY = 0.45f;
-
-    [Tooltip("[VerticalSignedFromCenter用] 画面中央から上方向へこの距離(m)動かすと最大伸長(l_max)")]
+    public float MouseLeanInLineOffsetY = 0.22f;
+    public float MouseLeanInUpRange = 0.35f;
     public float MouseExtendUpRange = 0.50f;
-
-    [Tooltip("[VerticalSignedFromCenter用] 画面中央から下方向へこの距離(m)動かすと最小屈曲(l_min)")]
     public float MouseFlexDownRange = 0.75f;
-
-    [Tooltip("[Distance系モード用] 画面中央からこの距離(m)以下に近づくと脚を最大長(l_max)まで伸長")]
     public float MouseFullExtendDist = 0.35f;
-
-    [Tooltip("[Distance系モード用] 画面中央からこの距離(m)以上に離れると脚を最小長(l_min)まで短縮")]
     public float MouseFullFlexDist = 1.35f;
-
-    [Tooltip("画面の左右中央線上でのチャタリング防止用微小デッドゾーン(m)")]
     public float MouseLineDeadzone = 0.005f;
 
     public SimState CurrentState => _state;
@@ -57,61 +44,45 @@ public class SkyTechGameController : MonoBehaviour
     public float LastTurnPeakCoMDeg { get; private set; }
     public string LastTurnEvaluation { get; private set; } = "READY";
     public bool IsCrashFrozen { get; private set; }
-
-    /// <summary>Q/Eキーで増減して固定されている股関節角度 (deg)</summary>
     public float TargetLegRollDeg => _lockedHipDeg;
 
     private SimState _state;
     private SimInput _input;
-    private float _lockedHipDeg = 0f;
-    private float _crashFrozenTimer = 0f;
-    private float _timeSinceLastSwitch = 0f;
-    private float _lastEdgeSign = 0f;
-    private float _skidDurationInTurn = 0f;
-    private bool _isSteerNeutralActive = false;
+    private float _lockedHipDeg;
+    private float _crashFrozenTimer;
+    private float _timeSinceLastSwitch;
+    private float _lastEdgeSign;
+    private float _skidDurationInTurn;
+    private bool _isSteerNeutralActive;
 
-    // 外側マウスの中央戻し検出＆脚プッシュ連動用状態変数
-    private float _prevAbsDx = 0f;
-    private bool _hasPrevMouseSample = false;
-    private float _centerReturnPushBoost = 0f;
+    private float _prevAbsDx;
+    private bool _hasPrevMouseSample;
+    private float _centerReturnPushBoost;
 
-    private float _leftRollHoldTimer = 0f;
-    private float _leftRollRepeatTimer = 0f;
-    private float _rightRollHoldTimer = 0f;
-    private float _rightRollRepeatTimer = 0f;
+    private float _leftRollHoldTimer, _leftRollRepeatTimer;
+    private float _rightRollHoldTimer, _rightRollRepeatTimer;
 
     private const float RollRepeatInitialDelay = 0.28f;
     private const float RollRepeatInterval = 0.08f;
     private const float RollDegreeStep = 2.0f;
-
     private const float TurnSwitchMinTime = 0.45f;
     private const float TurnSwitchMinPeakDeg = 15.0f;
     private const float CrashFreezeDuration = 1.5f;
 
     private void Awake()
     {
-        if (Config == null)
-        {
-            Config = ScriptableObject.CreateInstance<SkyTechSimConfig>();
-        }
+        if (Config == null) Config = ScriptableObject.CreateInstance<SkyTechSimConfig>();
     }
 
-    private void Start()
-    {
-        ResetSimulation();
-    }
+    private void Start() => ResetSimulation();
 
-    private void Update()
-    {
-        HandleKeyboardInput();
-    }
+    private void Update() => HandleKeyboardInput();
 
     private void FixedUpdate()
     {
         if (IsCrashFrozen)
         {
-            _crashFrozenTimer -= Time.fixedDeltaTime;
-            if (_crashFrozenTimer <= 0f)
+            if ((_crashFrozenTimer -= Time.fixedDeltaTime) <= 0f)
             {
                 IsCrashFrozen = false;
                 ResetSimulation();
@@ -129,7 +100,7 @@ public class SkyTechGameController : MonoBehaviour
             return;
         }
 
-        if (_state.gripState == SkiGripState.HipCrash || _state.gripState == SkiGripState.BootOut)
+        if (_state.gripState is SkiGripState.HipCrash or SkiGripState.BootOut)
         {
             TriggerCrash();
             return;
@@ -141,155 +112,58 @@ public class SkyTechGameController : MonoBehaviour
 
     private void HandleKeyboardInput()
     {
-        if (IsKeyPressedThisFrame(KeyCode.R, KeyCodeToKey(KeyCode.R)))
+        if (IsKeyDown(KeyCode.R))
         {
             ResetSimulation();
             return;
         }
 
-        if (IsKeyPressedThisFrame(KeyCode.Tab, KeyCodeToKey(KeyCode.Tab)))
-        {
-            AutoAngulationAssist = !AutoAngulationAssist;
-        }
+        if (IsKeyDown(KeyCode.Tab)) AutoAngulationAssist = !AutoAngulationAssist;
 
         if (IsCrashFrozen)
         {
-            _input.u_ext_norm = 0f;
-            _input.u_flex_norm = 0f;
-            _input.l1_target = 0f;
-            _input.phi_lock_cmd = 0f;
-            _input.phi_steer_cmd = 0f;
-            _input.mouse_world = Vector2.zero;
-            _input.has_mouse_world = false;
-            _input.steer_neutral_cmd = false;
-            _input.w_reset = false;
+            _input = default;
             _isSteerNeutralActive = false;
             _centerReturnPushBoost = 0f;
             return;
         }
 
-        bool qDown = IsKeyPressedThisFrame(KeyCode.Q, KeyCodeToKey(KeyCode.Q));
-        bool qHeld = IsKeyHeld(KeyCode.Q, KeyCodeToKey(KeyCode.Q));
+        bool qDown = IsKeyDown(KeyCode.Q), qHeld = IsKeyHeld(KeyCode.Q);
+        bool eDown = IsKeyDown(KeyCode.E), eHeld = IsKeyHeld(KeyCode.E);
+        bool resetActive = IsKeyDown(KeyCode.W) || IsKeyHeld(KeyCode.W)
+                        || IsKeyDown(KeyCode.X) || IsKeyHeld(KeyCode.X)
+                        || IsKeyDown(KeyCode.C) || IsKeyHeld(KeyCode.C)
+                        || (qHeld && eHeld);
 
-        bool eDown = IsKeyPressedThisFrame(KeyCode.E, KeyCodeToKey(KeyCode.E));
-        bool eHeld = IsKeyHeld(KeyCode.E, KeyCodeToKey(KeyCode.E));
-
-        bool wDown = IsKeyPressedThisFrame(KeyCode.W, KeyCodeToKey(KeyCode.W));
-        bool wHeld = IsKeyHeld(KeyCode.W, KeyCodeToKey(KeyCode.W));
-
-        bool resetDown = wDown
-                      || IsKeyPressedThisFrame(KeyCode.X, KeyCodeToKey(KeyCode.X))
-                      || IsKeyPressedThisFrame(KeyCode.C, KeyCodeToKey(KeyCode.C))
-                      || (qDown && eHeld) || (eDown && qHeld);
-        bool resetHeld = wHeld
-                      || IsKeyHeld(KeyCode.X, KeyCodeToKey(KeyCode.X))
-                      || IsKeyHeld(KeyCode.C, KeyCodeToKey(KeyCode.C))
-                      || (qHeld && eHeld);
-
-        if (resetDown || resetHeld)
+        if (resetActive)
         {
-            _lockedHipDeg = 0.0f;
-            _input.phi_steer_cmd = 0.0f;
+            _lockedHipDeg = 0f;
+            _input.phi_steer_cmd = 0f;
+            _input.mouse_lean_out_norm = 0f;
+            _input.mouse_lean_in_norm = 0f;
             _input.steer_neutral_cmd = false;
             _input.w_reset = true;
             _isSteerNeutralActive = false;
-            _leftRollHoldTimer = 0f;
-            _leftRollRepeatTimer = 0f;
-            _rightRollHoldTimer = 0f;
-            _rightRollRepeatTimer = 0f;
+            _leftRollHoldTimer = _leftRollRepeatTimer = _rightRollHoldTimer = _rightRollRepeatTimer = 0f;
             _centerReturnPushBoost = 0f;
         }
         else
         {
             _input.w_reset = false;
-
-            if (qDown)
-            {
-                float step = (_lockedHipDeg > 0.001f) ? (RollDegreeStep * 2.0f) : RollDegreeStep;
-                float nextDeg = _lockedHipDeg - step;
-                if (_lockedHipDeg > 0.001f && nextDeg < 0.0f)
-                {
-                    nextDeg = 0.0f;
-                }
-                _lockedHipDeg = Mathf.Clamp(nextDeg, -75.0f, 75.0f);
-                _leftRollHoldTimer = 0f;
-                _leftRollRepeatTimer = 0f;
-            }
-            else if (qHeld)
-            {
-                _leftRollHoldTimer += Time.deltaTime;
-                if (_leftRollHoldTimer >= RollRepeatInitialDelay)
-                {
-                    _leftRollRepeatTimer += Time.deltaTime;
-                    if (_leftRollRepeatTimer >= RollRepeatInterval)
-                    {
-                        float step = (_lockedHipDeg > 0.001f) ? (RollDegreeStep * 2.0f) : RollDegreeStep;
-                        float nextDeg = _lockedHipDeg - step;
-                        if (_lockedHipDeg > 0.001f && nextDeg < 0.0f)
-                        {
-                            nextDeg = 0.0f;
-                        }
-                        _lockedHipDeg = Mathf.Clamp(nextDeg, -75.0f, 75.0f);
-                        _leftRollRepeatTimer = 0f;
-                    }
-                }
-            }
-            else
-            {
-                _leftRollHoldTimer = 0f;
-                _leftRollRepeatTimer = 0f;
-            }
-
-            if (eDown)
-            {
-                float step = (_lockedHipDeg < -0.001f) ? (RollDegreeStep * 2.0f) : RollDegreeStep;
-                float nextDeg = _lockedHipDeg + step;
-                if (_lockedHipDeg < -0.001f && nextDeg > 0.0f)
-                {
-                    nextDeg = 0.0f;
-                }
-                _lockedHipDeg = Mathf.Clamp(nextDeg, -75.0f, 75.0f);
-                _rightRollHoldTimer = 0f;
-                _rightRollRepeatTimer = 0f;
-            }
-            else if (eHeld)
-            {
-                _rightRollHoldTimer += Time.deltaTime;
-                if (_rightRollHoldTimer >= RollRepeatInitialDelay)
-                {
-                    _rightRollRepeatTimer += Time.deltaTime;
-                    if (_rightRollRepeatTimer >= RollRepeatInterval)
-                    {
-                        float step = (_lockedHipDeg < -0.001f) ? (RollDegreeStep * 2.0f) : RollDegreeStep;
-                        float nextDeg = _lockedHipDeg + step;
-                        if (_lockedHipDeg < -0.001f && nextDeg > 0.0f)
-                        {
-                            nextDeg = 0.0f;
-                        }
-                        _lockedHipDeg = Mathf.Clamp(nextDeg, -75.0f, 75.0f);
-                        _rightRollRepeatTimer = 0f;
-                    }
-                }
-            }
-            else
-            {
-                _rightRollHoldTimer = 0f;
-                _rightRollRepeatTimer = 0f;
-            }
+            UpdateRollRepeat(qDown, qHeld, -1f, ref _leftRollHoldTimer, ref _leftRollRepeatTimer);
+            UpdateRollRepeat(eDown, eHeld,  1f, ref _rightRollHoldTimer, ref _rightRollRepeatTimer);
         }
 
         _input.phi_lock_cmd = _lockedHipDeg * Mathf.Deg2Rad;
 
-        bool extPressed = IsKeyHeld(KeyCode.Space, KeyCodeToKey(KeyCode.Space))
-                       || IsKeyHeld(KeyCode.UpArrow, KeyCodeToKey(KeyCode.UpArrow));
-
-        bool flexPressed = IsKeyHeld(KeyCode.S, KeyCodeToKey(KeyCode.S));
+        bool extPressed = IsKeyHeld(KeyCode.Space) || IsKeyHeld(KeyCode.UpArrow);
+        bool flexPressed = IsKeyHeld(KeyCode.S);
 
 #if ENABLE_INPUT_SYSTEM
         if (Gamepad.current != null)
         {
-            if (!extPressed) extPressed = Gamepad.current.buttonSouth.isPressed;
-            if (!flexPressed) flexPressed = Gamepad.current.buttonEast.isPressed;
+            extPressed |= Gamepad.current.buttonSouth.isPressed;
+            flexPressed |= Gamepad.current.buttonEast.isPressed;
         }
 #endif
 
@@ -299,98 +173,76 @@ public class SkyTechGameController : MonoBehaviour
         _input.mouse_world = mouseWorld;
         _input.has_mouse_world = hasMouseWorld;
 
-        // --- 0. 外側に移動したマウスを中央に戻す求心動作の検出（上体側屈伸展＋脚プッシュ連動） ---
         float safeDt = Mathf.Max(1e-4f, Time.deltaTime);
+        float baseCenterY = screenCenterWorld.y + MouseCenterOffsetY;
+        float dy = mouseWorld.y - baseCenterY;
+
+        // 0. マウス求心動作の検出 ＆ 上下基準線からのリーンアウト/リーンイン算出
         if (hasMouseWorld && Config != null)
         {
+            _input.mouse_lean_out_norm = (dy < 0f) ? Mathf.Clamp01(-dy / Mathf.Max(0.05f, MouseFlexDownRange)) : 0f;
+
+            float leanInOffset = Mathf.Max(0.02f, MouseLeanInLineOffsetY);
+            _input.mouse_lean_in_norm = (dy > leanInOffset)
+                ? Mathf.Clamp01((dy - leanInOffset) / Mathf.Max(0.05f, MouseLeanInUpRange))
+                : 0f;
+
             float absDx = Mathf.Abs(mouseWorld.x - screenCenterWorld.x);
             if (_hasPrevMouseSample)
             {
                 float inwardSpeed = Mathf.Max(0f, (_prevAbsDx - absDx) / safeDt);
                 float turnBankGate = Mathf.Clamp01((Mathf.Abs(_state.theta1) * Mathf.Rad2Deg - 8.0f) / 14.0f);
                 float returnTarget = Mathf.Clamp01((inwardSpeed / 1.6f) * Config.centerReturnPushGain) * turnBankGate;
-
-                if (returnTarget > _centerReturnPushBoost)
-                {
-                    _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, returnTarget, 12.0f * safeDt);
-                }
-                else
-                {
-                    _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, 0f, 3.2f * safeDt);
-                }
+                float rate = (returnTarget > _centerReturnPushBoost) ? 12.0f : 3.2f;
+                float target = (returnTarget > _centerReturnPushBoost) ? returnTarget : 0f;
+                _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, target, rate * safeDt);
             }
             _prevAbsDx = absDx;
             _hasPrevMouseSample = true;
         }
         else
         {
+            _input.mouse_lean_out_norm = 0f;
+            _input.mouse_lean_in_norm = 0f;
             _hasPrevMouseSample = false;
             _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, 0f, 4.0f * safeDt);
         }
 
-        // --- 1. 脚の伸縮入力（キーボード優先、未押下時は画面中央基準の高さ＋中央戻しプッシュ連動） ---
+        // 1. 脚の伸縮入力
         if (extPressed || flexPressed)
         {
             _input.l1_target = 0f;
+            _input.u_ext_norm = extPressed ? Mathf.MoveTowards(_input.u_ext_norm, 1.0f, 45.0f * Time.deltaTime) : 0f;
+            _input.u_flex_norm = flexPressed ? Mathf.MoveTowards(_input.u_flex_norm, 1.0f, 24.0f * Time.deltaTime) : 0f;
 
-            if (extPressed)
+            if (extPressed && !qHeld && !eHeld && _state.gripState != SkiGripState.Skidding && _state.snow_stress_ratio < 0.9f)
             {
-                _input.u_ext_norm = Mathf.MoveTowards(_input.u_ext_norm, 1.0f, 45.0f * Time.deltaTime);
-
-                if (!qHeld && !eHeld && _state.gripState != SkiGripState.Skidding && _state.snow_stress_ratio < 0.9f)
-                {
-                    _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 35.0f * Time.deltaTime);
-                }
-            }
-            else
-            {
-                _input.u_ext_norm = 0f;
-            }
-
-            if (flexPressed)
-            {
-                _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, 1.0f, 24.0f * Time.deltaTime);
-            }
-            else
-            {
-                _input.u_flex_norm = 0f;
+                _lockedHipDeg = Mathf.MoveTowards(_lockedHipDeg, 0f, 35.0f * Time.deltaTime);
             }
         }
         else if (hasMouseWorld && Config != null)
         {
-            float baseCenterY = screenCenterWorld.y + MouseCenterOffsetY;
-            float dy = mouseWorld.y - baseCenterY;
             float neutralL1 = Mathf.Clamp(Config.l_max - Config.supportDropFromMaxMeters, Config.l_min, Config.l_max);
-
-            float baseTargetL1 = HeightControlMode switch
+            float baseTargetL1 = (dy < 0f) ? neutralL1 : HeightControlMode switch
             {
                 MouseHeightControlMode.VerticalSignedFromCenter =>
-                    neutralL1 + Mathf.Clamp(dy / Mathf.Max(0.05f, dy >= 0f ? MouseExtendUpRange : MouseFlexDownRange), -1f, 1f)
-                              * (dy >= 0f ? (Config.l_max - neutralL1) : (neutralL1 - Config.l_min)),
-
+                    neutralL1 + Mathf.Clamp01(dy / Mathf.Max(0.05f, MouseExtendUpRange)) * (Config.l_max - neutralL1),
                 MouseHeightControlMode.VerticalDistanceFromCenter =>
-                    Mathf.Lerp(Config.l_max, Config.l_min, Mathf.InverseLerp(MouseFullExtendDist, MouseFullFlexDist, Mathf.Abs(dy))),
-
+                    Mathf.Lerp(Config.l_max, neutralL1, Mathf.InverseLerp(MouseFullExtendDist, MouseFullFlexDist, dy)),
                 _ =>
-                    Mathf.Lerp(Config.l_max, Config.l_min, Mathf.InverseLerp(MouseFullExtendDist, MouseFullFlexDist, Vector2.Distance(mouseWorld, new Vector2(screenCenterWorld.x, baseCenterY))))
+                    Mathf.Lerp(Config.l_max, neutralL1, Mathf.InverseLerp(MouseFullExtendDist, MouseFullFlexDist, Vector2.Distance(mouseWorld, new Vector2(screenCenterWorld.x, baseCenterY))))
             };
 
             float targetL1 = Mathf.Lerp(baseTargetL1, Config.l_max, _centerReturnPushBoost * 0.85f);
             _input.l1_target = targetL1;
 
-            float dampedError = (targetL1 - _state.l1) - 0.08f * _state.dl1;
-            float linDrive = Mathf.Clamp(dampedError / 0.12f, -1.0f, 1.0f);
+            float linDrive = Mathf.Clamp(((targetL1 - _state.l1) - 0.08f * _state.dl1) / 0.12f, -1.0f, 1.0f);
             float smoothDrive = linDrive * Mathf.Abs(linDrive);
+            float topBoost = Mathf.SmoothStep(0f, 1f, (targetL1 - (Config.l_max - 0.03f)) / 0.025f);
+            float extTarget = Mathf.Max(Mathf.Max(0f, smoothDrive), Mathf.Max(topBoost, _centerReturnPushBoost));
 
-            float topBoost    = Mathf.SmoothStep(0f, 1f, (targetL1 - (Config.l_max - 0.03f)) / 0.025f);
-            float bottomBoost = Mathf.SmoothStep(0f, 1f, ((Config.l_min + 0.03f) - targetL1) / 0.025f)
-                              * Mathf.Clamp01((_state.l1 - targetL1) / 0.03f);
-
-            float extTarget  = Mathf.Max(Mathf.Max(0f, smoothDrive), Mathf.Max(topBoost, _centerReturnPushBoost));
-            float flexTarget = Mathf.Max(Mathf.Max(0f, -smoothDrive), bottomBoost) * (1.0f - _centerReturnPushBoost);
-
-            _input.u_ext_norm  = Mathf.MoveTowards(_input.u_ext_norm,  extTarget,  35.0f * Time.deltaTime);
-            _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, flexTarget, 24.0f * Time.deltaTime);
+            _input.u_ext_norm = Mathf.MoveTowards(_input.u_ext_norm, extTarget, 35.0f * Time.deltaTime);
+            _input.u_flex_norm = Mathf.MoveTowards(_input.u_flex_norm, 0f, 24.0f * Time.deltaTime);
         }
         else
         {
@@ -399,21 +251,19 @@ public class SkyTechGameController : MonoBehaviour
             _input.u_flex_norm = 0f;
         }
 
-        // --- 2. 左右の頂点誘導入力 ---
+        // 2. 左右の頂点誘導入力
         float steer = 0f;
-        bool kbLeft = IsKeyHeld(KeyCode.A, KeyCodeToKey(KeyCode.A)) || IsKeyHeld(KeyCode.LeftArrow, KeyCodeToKey(KeyCode.LeftArrow));
-        bool kbRight = IsKeyHeld(KeyCode.D, KeyCodeToKey(KeyCode.D)) || IsKeyHeld(KeyCode.RightArrow, KeyCodeToKey(KeyCode.RightArrow));
+        bool kbLeft = IsKeyHeld(KeyCode.A) || IsKeyHeld(KeyCode.LeftArrow);
+        bool kbRight = IsKeyHeld(KeyCode.D) || IsKeyHeld(KeyCode.RightArrow);
 
         if (kbLeft || kbRight)
         {
-            if (kbLeft) steer -= 1f;
-            if (kbRight) steer += 1f;
+            steer = (kbRight ? 1f : 0f) - (kbLeft ? 1f : 0f);
         }
         else if (hasMouseWorld)
         {
             float dx = mouseWorld.x - screenCenterWorld.x;
             float absDx = Mathf.Abs(dx);
-
             if (absDx > MouseLineDeadzone)
             {
                 float fullRange = (Config != null) ? Mathf.Max(0.15f, Config.mouseSteerFullRange) : 1.05f;
@@ -422,19 +272,9 @@ public class SkyTechGameController : MonoBehaviour
             }
         }
 
-        bool downPressed = IsKeyPressedThisFrame(KeyCode.DownArrow, KeyCodeToKey(KeyCode.DownArrow));
-        bool downHeld = IsKeyHeld(KeyCode.DownArrow, KeyCodeToKey(KeyCode.DownArrow));
-
-        if (downPressed || downHeld)
-        {
-            _isSteerNeutralActive = true;
-        }
-
-        if (Mathf.Abs(steer) > 0.01f)
-        {
-            _isSteerNeutralActive = false;
-        }
-
+        bool downHeld = IsKeyHeld(KeyCode.DownArrow);
+        if (IsKeyDown(KeyCode.DownArrow) || downHeld) _isSteerNeutralActive = true;
+        if (Mathf.Abs(steer) > 0.01f) _isSteerNeutralActive = false;
         if (_isSteerNeutralActive && !downHeld && Mathf.Abs(_state.u_shift_filtered) < 0.01f && Mathf.Abs(_state.phi_bend) < 0.01f)
         {
             _isSteerNeutralActive = false;
@@ -444,11 +284,44 @@ public class SkyTechGameController : MonoBehaviour
         _input.steer_neutral_cmd = _isSteerNeutralActive;
     }
 
-    private static bool TryGetMouseWorldPosition(out Vector2 worldPos, out Vector2 screenCenterWorld)
+    private void UpdateRollRepeat(bool down, bool held, float dir, ref float holdTimer, ref float repeatTimer)
     {
-        worldPos = Vector2.zero;
-        screenCenterWorld = Vector2.zero;
+        if (down)
+        {
+            StepLockedHip(dir);
+            holdTimer = repeatTimer = 0f;
+        }
+        else if (held)
+        {
+            holdTimer += Time.deltaTime;
+            if (holdTimer >= RollRepeatInitialDelay)
+            {
+                repeatTimer += Time.deltaTime;
+                if (repeatTimer >= RollRepeatInterval)
+                {
+                    StepLockedHip(dir);
+                    repeatTimer = 0f;
+                }
+            }
+        }
+        else
+        {
+            holdTimer = repeatTimer = 0f;
+        }
+    }
 
+    private void StepLockedHip(float dir)
+    {
+        bool isOpposite = (_lockedHipDeg * dir) < -0.001f;
+        float step = isOpposite ? (RollDegreeStep * 2.0f) : RollDegreeStep;
+        float nextDeg = _lockedHipDeg + dir * step;
+        if (isOpposite && (nextDeg * dir) > 0.0f) nextDeg = 0.0f;
+        _lockedHipDeg = Mathf.Clamp(nextDeg, -75.0f, 75.0f);
+    }
+
+    public static bool TryGetMouseWorldPosition(out Vector2 worldPos, out Vector2 screenCenterWorld)
+    {
+        worldPos = screenCenterWorld = Vector2.zero;
         Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
         if (cam == null) return false;
 
@@ -464,15 +337,12 @@ public class SkyTechGameController : MonoBehaviour
                 hasPos = true;
             }
         }
-        catch
-        {
-            hasPos = false;
-        }
+        catch { hasPos = false; }
 
 #if ENABLE_INPUT_SYSTEM
         if (!hasPos)
         {
-            var pointer = (Pointer.current != null) ? Pointer.current : (Pointer)Mouse.current;
+            var pointer = Pointer.current ?? (Pointer)Mouse.current;
             if (pointer != null)
             {
                 Vector2 mp = pointer.position.ReadValue();
@@ -480,175 +350,87 @@ public class SkyTechGameController : MonoBehaviour
                 {
                     screenPos = new Vector3(mp.x, mp.y, 0f);
                     hasPos = true;
-
 #if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
-                    float retinaFactor = 1.0f;
 #if UNITY_EDITOR
-                    retinaFactor = UnityEditor.EditorGUIUtility.pixelsPerPoint;
+                    float retinaFactor = UnityEditor.EditorGUIUtility.pixelsPerPoint;
 #else
-                    if (Display.main.systemWidth > 0 && Display.main.renderingWidth > 0)
-                    {
-                        retinaFactor = (float)Display.main.renderingWidth / Display.main.systemWidth;
-                    }
-                    else if (Screen.dpi > 160f)
-                    {
-                        retinaFactor = 2.0f;
-                    }
+                    float retinaFactor = (Display.main.systemWidth > 0 && Display.main.renderingWidth > 0)
+                        ? (float)Display.main.renderingWidth / Display.main.systemWidth
+                        : (Screen.dpi > 160f ? 2.0f : 1.0f);
 #endif
-                    if (retinaFactor > 1.05f)
+                    if (retinaFactor > 1.05f &&
+                        screenPos.x * retinaFactor <= cam.pixelWidth * 1.05f &&
+                        screenPos.y * retinaFactor <= cam.pixelHeight * 1.05f)
                     {
-                        if (screenPos.x * retinaFactor <= cam.pixelWidth * 1.05f &&
-                            screenPos.y * retinaFactor <= cam.pixelHeight * 1.05f)
-                        {
-                            screenPos.x *= retinaFactor;
-                            screenPos.y *= retinaFactor;
-                        }
+                        screenPos.x *= retinaFactor;
+                        screenPos.y *= retinaFactor;
                     }
 #endif
                 }
             }
         }
 #endif
-
         if (!hasPos) return false;
 
         float depth = -cam.transform.position.z;
         screenPos.z = depth;
-        Vector3 wp = cam.ScreenToWorldPoint(screenPos);
-        worldPos = new Vector2(wp.x, wp.y);
-
-        Vector3 centerScreen = new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, depth);
-        Vector3 cp = cam.ScreenToWorldPoint(centerScreen);
-        screenCenterWorld = new Vector2(cp.x, cp.y);
-
+        worldPos = cam.ScreenToWorldPoint(screenPos);
+        screenCenterWorld = cam.ScreenToWorldPoint(new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, depth));
         return true;
     }
 
 #if ENABLE_INPUT_SYSTEM
-    private static Key KeyCodeToKey(KeyCode kc)
+    private static KeyControl GetKeyControl(Keyboard kb, KeyCode kc) => kc switch
     {
-        switch (kc)
-        {
-            case KeyCode.Space: return Key.Space;
-            case KeyCode.W: return Key.W;
-            case KeyCode.S: return Key.S;
-            case KeyCode.UpArrow: return Key.UpArrow;
-            case KeyCode.DownArrow: return Key.DownArrow;
-            case KeyCode.A: return Key.A;
-            case KeyCode.D: return Key.D;
-            case KeyCode.LeftArrow: return Key.LeftArrow;
-            case KeyCode.RightArrow: return Key.RightArrow;
-            case KeyCode.Q: return Key.Q;
-            case KeyCode.E: return Key.E;
-            case KeyCode.R: return Key.R;
-            case KeyCode.Tab: return Key.Tab;
-            case KeyCode.X: return Key.X;
-            case KeyCode.C: return Key.C;
-            default: return Key.None;
-        }
-    }
-#else
-    private static int KeyCodeToKey(KeyCode kc) => 0;
+        KeyCode.Space => kb.spaceKey,
+        KeyCode.W => kb.wKey,
+        KeyCode.S => kb.sKey,
+        KeyCode.A => kb.aKey,
+        KeyCode.D => kb.dKey,
+        KeyCode.Q => kb.qKey,
+        KeyCode.E => kb.eKey,
+        KeyCode.R => kb.rKey,
+        KeyCode.X => kb.xKey,
+        KeyCode.C => kb.cKey,
+        KeyCode.Tab => kb.tabKey,
+        KeyCode.UpArrow => kb.upArrowKey,
+        KeyCode.DownArrow => kb.downArrowKey,
+        KeyCode.LeftArrow => kb.leftArrowKey,
+        KeyCode.RightArrow => kb.rightArrowKey,
+        _ => null
+    };
 #endif
 
-    private static bool IsKeyHeld(KeyCode legacyKey,
-#if ENABLE_INPUT_SYSTEM
-        Key newKey
-#else
-        int dummy = 0
-#endif
-    )
+    private static bool IsKeyHeld(KeyCode key)
     {
 #if ENABLE_INPUT_SYSTEM
-        var kb = Keyboard.current;
-        if (kb != null && newKey != Key.None)
-        {
-            switch (newKey)
-            {
-                case Key.Space: if (kb.spaceKey.isPressed) return true; break;
-                case Key.W: if (kb.wKey.isPressed) return true; break;
-                case Key.S: if (kb.sKey.isPressed) return true; break;
-                case Key.UpArrow: if (kb.upArrowKey.isPressed) return true; break;
-                case Key.DownArrow: if (kb.downArrowKey.isPressed) return true; break;
-                case Key.A: if (kb.aKey.isPressed) return true; break;
-                case Key.D: if (kb.dKey.isPressed) return true; break;
-                case Key.LeftArrow: if (kb.leftArrowKey.isPressed) return true; break;
-                case Key.RightArrow: if (kb.rightArrowKey.isPressed) return true; break;
-                case Key.Q: if (kb.qKey.isPressed) return true; break;
-                case Key.E: if (kb.eKey.isPressed) return true; break;
-                case Key.R: if (kb.rKey.isPressed) return true; break;
-                case Key.Tab: if (kb.tabKey.isPressed) return true; break;
-                case Key.X: if (kb.xKey.isPressed) return true; break;
-                case Key.C: if (kb.cKey.isPressed) return true; break;
-            }
-        }
+        if (Keyboard.current != null && GetKeyControl(Keyboard.current, key) is { isPressed: true }) return true;
 #endif
-        try { return Input.GetKey(legacyKey); }
-        catch { return false; }
+        try { return Input.GetKey(key); } catch { return false; }
     }
 
-    private static bool IsKeyPressedThisFrame(KeyCode legacyKey,
-#if ENABLE_INPUT_SYSTEM
-        Key newKey
-#else
-        int dummy = 0
-#endif
-    )
+    private static bool IsKeyDown(KeyCode key)
     {
 #if ENABLE_INPUT_SYSTEM
-        var kb = Keyboard.current;
-        if (kb != null && newKey != Key.None)
-        {
-            switch (newKey)
-            {
-                case Key.Space: if (kb.spaceKey.wasPressedThisFrame) return true; break;
-                case Key.W: if (kb.wKey.wasPressedThisFrame) return true; break;
-                case Key.S: if (kb.sKey.wasPressedThisFrame) return true; break;
-                case Key.UpArrow: if (kb.upArrowKey.wasPressedThisFrame) return true; break;
-                case Key.DownArrow: if (kb.downArrowKey.wasPressedThisFrame) return true; break;
-                case Key.A: if (kb.aKey.wasPressedThisFrame) return true; break;
-                case Key.D: if (kb.dKey.wasPressedThisFrame) return true; break;
-                case Key.LeftArrow: if (kb.leftArrowKey.wasPressedThisFrame) return true; break;
-                case Key.RightArrow: if (kb.rightArrowKey.wasPressedThisFrame) return true; break;
-                case Key.Q: if (kb.qKey.wasPressedThisFrame) return true; break;
-                case Key.E: if (kb.eKey.wasPressedThisFrame) return true; break;
-                case Key.R: if (kb.rKey.wasPressedThisFrame) return true; break;
-                case Key.Tab: if (kb.tabKey.wasPressedThisFrame) return true; break;
-                case Key.X: if (kb.xKey.wasPressedThisFrame) return true; break;
-                case Key.C: if (kb.cKey.wasPressedThisFrame) return true; break;
-            }
-        }
+        if (Keyboard.current != null && GetKeyControl(Keyboard.current, key) is { wasPressedThisFrame: true }) return true;
 #endif
-        try { return Input.GetKeyDown(legacyKey); }
-        catch { return false; }
+        try { return Input.GetKeyDown(key); } catch { return false; }
     }
 
     private void UpdateTurnTelemetry()
     {
         _timeSinceLastSwitch += Time.fixedDeltaTime;
-
-        float currentEdgeDeg = Mathf.Abs(_state.theta1) * Mathf.Rad2Deg;
-        float currentCoMDeg = Mathf.Abs(_state.Psi_CoM) * Mathf.Rad2Deg;
-
-        CurrentTurnPeakEdgeDeg = Mathf.Max(CurrentTurnPeakEdgeDeg, currentEdgeDeg);
-        CurrentTurnPeakCoMDeg = Mathf.Max(CurrentTurnPeakCoMDeg, currentCoMDeg);
-
-        if (_state.gripState == SkiGripState.Skidding)
-        {
-            _skidDurationInTurn += Time.fixedDeltaTime;
-        }
+        CurrentTurnPeakEdgeDeg = Mathf.Max(CurrentTurnPeakEdgeDeg, Mathf.Abs(_state.theta1) * Mathf.Rad2Deg);
+        CurrentTurnPeakCoMDeg = Mathf.Max(CurrentTurnPeakCoMDeg, Mathf.Abs(_state.Psi_CoM) * Mathf.Rad2Deg);
+        if (_state.gripState == SkiGripState.Skidding) _skidDurationInTurn += Time.fixedDeltaTime;
     }
 
     private void CheckTurnSwitch()
     {
         float currentSign = Mathf.Sign(_state.theta1);
-
         if (_lastEdgeSign == 0f)
         {
-            if (Mathf.Abs(_state.theta1) > 0.01f)
-            {
-                _lastEdgeSign = currentSign;
-            }
+            if (Mathf.Abs(_state.theta1) > 0.01f) _lastEdgeSign = currentSign;
             return;
         }
 
@@ -658,7 +440,6 @@ public class SkyTechGameController : MonoBehaviour
             {
                 EvaluateCompletedTurn();
             }
-
             _lastEdgeSign = currentSign;
         }
     }
@@ -668,34 +449,22 @@ public class SkyTechGameController : MonoBehaviour
         TurnCount++;
         ComboCount++;
 
-        float baseScore = CurrentTurnPeakEdgeDeg;
         bool hasAngulationBonus = CurrentTurnPeakEdgeDeg > (CurrentTurnPeakCoMDeg + 3.0f);
-        if (hasAngulationBonus)
+        float baseScore = CurrentTurnPeakEdgeDeg * (hasAngulationBonus ? 1.25f : 1.0f);
+        baseScore *= Mathf.Clamp01(1.0f - (_skidDurationInTurn * 0.20f));
+        TotalScore += baseScore * (1.0f + (ComboCount - 1) * 0.10f);
+
+        LastTurnEvaluation = CurrentTurnPeakEdgeDeg switch
         {
-            baseScore *= 1.25f;
-        }
-
-        float skidMultiplier = Mathf.Clamp01(1.0f - (_skidDurationInTurn * 0.20f));
-        baseScore *= skidMultiplier;
-
-        float comboMultiplier = 1.0f + (ComboCount - 1) * 0.10f;
-        TotalScore += baseScore * comboMultiplier;
-
-        if (CurrentTurnPeakEdgeDeg >= 65.0f)
-            LastTurnEvaluation = hasAngulationBonus ? "WORLD CUP CARVE!!" : "WORLD CUP SPEED!";
-        else if (CurrentTurnPeakEdgeDeg >= 50.0f)
-            LastTurnEvaluation = hasAngulationBonus ? "DEEP CARVE!" : "SOLID EDGE!";
-        else if (CurrentTurnPeakEdgeDeg >= 35.0f)
-            LastTurnEvaluation = "GOOD TURN";
-        else
-            LastTurnEvaluation = "SHALLOW TURN";
+            >= 65.0f => hasAngulationBonus ? "WORLD CUP CARVE!!" : "WORLD CUP SPEED!",
+            >= 50.0f => hasAngulationBonus ? "DEEP CARVE!" : "SOLID EDGE!",
+            >= 35.0f => "GOOD TURN",
+            _ => "SHALLOW TURN"
+        };
 
         LastTurnPeakEdgeDeg = CurrentTurnPeakEdgeDeg;
         LastTurnPeakCoMDeg = CurrentTurnPeakCoMDeg;
-        CurrentTurnPeakEdgeDeg = 0f;
-        CurrentTurnPeakCoMDeg = 0f;
-        _skidDurationInTurn = 0f;
-        _timeSinceLastSwitch = 0f;
+        CurrentTurnPeakEdgeDeg = CurrentTurnPeakCoMDeg = _skidDurationInTurn = _timeSinceLastSwitch = 0f;
     }
 
     private void TriggerCrash()
@@ -703,37 +472,15 @@ public class SkyTechGameController : MonoBehaviour
         ComboCount = 0;
         IsCrashFrozen = true;
         _crashFrozenTimer = CrashFreezeDuration;
-
         LastTurnEvaluation = (_state.gripState == SkiGripState.BootOut) ? "BOOT OUT CRASH!" : "HIP CRASH!";
     }
 
     public void ResetSimulation()
     {
         _state = SkyTechPhysicsSolver.CreateInitialState(Config);
-        _lockedHipDeg = 0f;
-        _isSteerNeutralActive = false;
-        _prevAbsDx = 0f;
-        _hasPrevMouseSample = false;
-        _centerReturnPushBoost = 0f;
-        _input = new SimInput
-        {
-            u_ext_norm = 0f,
-            u_flex_norm = 0f,
-            l1_target = 0f,
-            phi_lock_cmd = 0f,
-            phi_steer_cmd = 0f,
-            mouse_world = Vector2.zero,
-            has_mouse_world = false,
-            steer_neutral_cmd = false,
-            w_reset = false
-        };
-
-        CurrentTurnPeakEdgeDeg = 0f;
-        CurrentTurnPeakCoMDeg = 0f;
-        _skidDurationInTurn = 0f;
-        _timeSinceLastSwitch = 0f;
-        _lastEdgeSign = 0f;
-        IsCrashFrozen = false;
-        _crashFrozenTimer = 0f;
+        _input = default;
+        _lockedHipDeg = _prevAbsDx = _centerReturnPushBoost = 0f;
+        _isSteerNeutralActive = _hasPrevMouseSample = IsCrashFrozen = false;
+        CurrentTurnPeakEdgeDeg = CurrentTurnPeakCoMDeg = _skidDurationInTurn = _timeSinceLastSwitch = _lastEdgeSign = _crashFrozenTimer = 0f;
     }
 }
