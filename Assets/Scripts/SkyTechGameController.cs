@@ -25,12 +25,14 @@ public class SkyTechGameController : MonoBehaviour
     public bool UseMouseControl = true;
     public MouseHeightControlMode HeightControlMode = MouseHeightControlMode.VerticalSignedFromCenter;
     public float MouseCenterOffsetY = 0.45f;
-    public float MouseLeanInLineOffsetY = 0.22f;
-    public float MouseLeanInUpRange = 0.35f;
-    public float MouseExtendUpRange = 0.50f;
+
+    public float MouseLeanInLineOffsetY = 2.20f;
+    public float MouseLeanInUpRange = 1.75f;
+    public float MouseExtendUpRange = 2.50f;
+
     public float MouseFlexDownRange = 0.75f;
     public float MouseFullExtendDist = 0.35f;
-    public float MouseFullFlexDist = 1.35f;
+    public float MouseFullFlexDist = 2.50f;
     public float MouseLineDeadzone = 0.005f;
 
     public SimState CurrentState => _state;
@@ -69,8 +71,19 @@ public class SkyTechGameController : MonoBehaviour
     private const float TurnSwitchMinPeakDeg = 15.0f;
     private const float CrashFreezeDuration = 1.5f;
 
+    private void EnforceUpdatedRanges()
+    {
+        if (MouseLeanInLineOffsetY < 2.0f) MouseLeanInLineOffsetY = 2.20f;
+        if (MouseLeanInUpRange < 1.5f)     MouseLeanInUpRange = 1.75f;
+        if (MouseExtendUpRange < 2.0f)     MouseExtendUpRange = 2.50f;
+        if (MouseFullFlexDist < 2.0f)      MouseFullFlexDist = 2.50f;
+    }
+
+    private void OnValidate() => EnforceUpdatedRanges();
+
     private void Awake()
     {
+        EnforceUpdatedRanges();
         if (Config == null) Config = ScriptableObject.CreateInstance<SkyTechSimConfig>();
     }
 
@@ -140,6 +153,7 @@ public class SkyTechGameController : MonoBehaviour
             _lockedHipDeg = 0f;
             _input.phi_steer_cmd = 0f;
             _input.mouse_lean_out_norm = 0f;
+            _input.mouse_mid_norm = 0f;
             _input.mouse_lean_in_norm = 0f;
             _input.steer_neutral_cmd = false;
             _input.w_reset = true;
@@ -177,12 +191,18 @@ public class SkyTechGameController : MonoBehaviour
         float baseCenterY = screenCenterWorld.y + MouseCenterOffsetY;
         float dy = mouseWorld.y - baseCenterY;
 
-        // 0. マウス求心動作の検出 ＆ 上下基準線からのリーンアウト/リーンイン算出
+        // 0. 上下基準線からのリーンアウト / 中間(鉛直〜ストレート) / リーンイン算出
         if (hasMouseWorld && Config != null)
         {
+            float leanInOffset = Mathf.Max(0.02f, MouseLeanInLineOffsetY);
+
+            // 中立基準線より下 (dy < 0): 0 -> 1 (鉛直を超えてさらにリーンアウト)
             _input.mouse_lean_out_norm = (dy < 0f) ? Mathf.Clamp01(-dy / Mathf.Max(0.05f, MouseFlexDownRange)) : 0f;
 
-            float leanInOffset = Mathf.Max(0.02f, MouseLeanInLineOffsetY);
+            // 中立基準線 (dy = 0: 鉛直) ～ Lean-in line (dy = leanInOffset: ストレート内倒) の補間比率 (0..1)
+            _input.mouse_mid_norm = (dy > 0f) ? Mathf.Clamp01(dy / leanInOffset) : 0f;
+
+            // Lean-in line より上 (dy > leanInOffset): 0 -> 1 (ストレート内倒を超えてさらに内倒)
             _input.mouse_lean_in_norm = (dy > leanInOffset)
                 ? Mathf.Clamp01((dy - leanInOffset) / Mathf.Max(0.05f, MouseLeanInUpRange))
                 : 0f;
@@ -203,6 +223,7 @@ public class SkyTechGameController : MonoBehaviour
         else
         {
             _input.mouse_lean_out_norm = 0f;
+            _input.mouse_mid_norm = 0f;
             _input.mouse_lean_in_norm = 0f;
             _hasPrevMouseSample = false;
             _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, 0f, 4.0f * safeDt);

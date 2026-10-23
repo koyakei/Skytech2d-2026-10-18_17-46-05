@@ -7,8 +7,15 @@ public class SkyTechVisualizer : MonoBehaviour
     [Header("=== 画面中央基準・頂点誘導ガイド表示設定 ===")]
     public bool ShowCenterCrosshair = true;
     public bool ShowPuppetApexGuide = true;
-    public float GuideExtendUpRange = 0.55f;
+    public float GuideExtendUpRange = 2.75f;
     public float GuideFlexDownRange = 0.75f;
+
+    private void EnforceVisualizerRanges()
+    {
+        if (GuideExtendUpRange < 2.0f) GuideExtendUpRange = 2.75f;
+    }
+
+    private void OnValidate() => EnforceVisualizerRanges();
 
     private SkyTechGameController _controller;
     private Material _lineMaterial;
@@ -37,6 +44,7 @@ public class SkyTechVisualizer : MonoBehaviour
 
     private void Awake()
     {
+        EnforceVisualizerRanges();
         _controller = GetComponent<SkyTechGameController>();
         EnsureCameraSetup();
 

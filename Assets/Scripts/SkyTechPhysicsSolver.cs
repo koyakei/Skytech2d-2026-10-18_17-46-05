@@ -20,8 +20,9 @@ namespace SkyTechSimulator
         public float l1_target;
         public float phi_lock_cmd;
         public float phi_steer_cmd;
-        public float mouse_lean_out_norm;
-        public float mouse_lean_in_norm;
+        public float mouse_lean_out_norm; // 中立基準線より下 (0..1: 鉛直を超えてリーンアウト)
+        public float mouse_mid_norm;      // 中立基準線(0: 鉛直) ～ Lean-in line(1: ストレート内倒)
+        public float mouse_lean_in_norm;  // Lean-in lineより上 (0..1: ストレート内倒を超えて内倒)
         public Vector2 mouse_world;
         public bool has_mouse_world;
         public bool steer_neutral_cmd;
@@ -211,8 +212,18 @@ namespace SkyTechSimulator
             float phiInMax = SoftMax(0.20f, Mathf.Abs(cfg.phi_in_maxRad));
             float tauHipMax = SoftMax(100.0f, cfg.hipSteerMaxIsoTorque);
             float sin1 = Mathf.Sin(s.theta1), cos1 = Mathf.Cos(s.theta1);
+            float absTheta1 = SoftMin(Mathf.Abs(s.theta1), 82f * Mathf.Deg2Rad);
+            float cosAbsTheta1 = SoftMax(0.15f, Mathf.Cos(absTheta1));
+            float sinAbsTheta1 = Mathf.Sin(absTheta1);
 
-            // 1. マウス上下基準線に基づく手動リーンアウト・手動リーンイン＆頂点誘導制御
+            // =========================================================================
+            // 1. マウス高さ基準線による姿勢マッピング
+            //    ・中立基準線 (midNorm=0, leanOut=0): 鉛直 (θ2 = 0 <=> φ = θ1)
+            //    ・中立基準線 ～ Lean-in line (0 < midNorm < 1): 鉛直とストレート内倒の間
+            //    ・Lean-in line (midNorm=1, leanIn=0): ストレート内倒 (θ2 = θ1 <=> φ = 0)
+            //    ・Lean-in line より上 (leanIn > 0): ストレートを超えてさらに内倒 (φ < 0)
+            //    ・中立基準線より下 (leanOut > 0): 鉛直を超えてさらにリーンアウト (|φ| > |θ1|)
+            // =========================================================================
             float gReset = BoolGate(input.w_reset);
             float activeGate = (1.0f - gReset) * (1.0f - BoolGate(input.steer_neutral_cmd));
 
@@ -231,17 +242,41 @@ namespace SkyTechSimulator
             float theta1_des = activeGate * AnalyticClamp(mouseTargetTheta1 + input.phi_lock_cmd, -maxTargetRollRad, maxTargetRollRad);
             float rollError = theta1_des - s.theta1;
 
+            float rollSignSmooth = SmoothSign(s.theta1, 6.0f * Mathf.Deg2Rad);
+            float shiftSignSmooth = SmoothSign(s.u_shift_filtered, 0.06f);
+            float oppositeInputGate = AnalyticClamp01(SoftPlus(-rollSignSmooth * shiftSignSmooth));
+            float leanOutGate = 1.0f - oppositeInputGate;
+
             float leanOutNorm = AnalyticClamp01(input.mouse_lean_out_norm);
+            float effLeanOut = leanOutNorm * leanOutGate;
+            float midNorm = AnalyticClamp01(input.mouse_mid_norm);
             float leanInNorm = AnalyticClamp01(input.mouse_lean_in_norm);
-            float deepRollFactor = AnalyticClamp01(Mathf.Abs(s.theta1) / (55.0f * Mathf.Deg2Rad));
-            float activeTurnDir = SmoothSign(s.theta1 + 0.35f * s.u_shift_filtered, 3.0f * Mathf.Deg2Rad);
+            float deepRollFactor = AnalyticClamp01(absTheta1 / (55.0f * Mathf.Deg2Rad));
 
-            float phi_manual_lean_out = leanOutNorm * (s.theta1 * (1.0f + cfg.trunkLeanOutRatio) + activeTurnDir * (phiMax * 0.55f) * (1.0f - deepRollFactor * 0.5f));
-            float phi_manual_lean_in = -leanInNorm * SmoothSign(s.u_shift_filtered + 0.50f * s.theta1, 0.04f) * phiInMax;
-            float directSteerScale = Mathf.Lerp(0.45f, 0.0f, leanOutNorm);
-            float phi_direct_input = -s.u_shift_filtered * (phiMax * directSteerScale) - input.phi_lock_cmd;
+            float neutralL1 = AnalyticClamp(cfg.l_max - cfg.supportDropFromMaxMeters, cfg.l_min, cfg.l_max);
+            float headReach = 1.55f * cfg.l2;
 
-            float phi_target = (1.0f - gReset) * AnalyticClamp(phi_direct_input + phi_manual_lean_out + phi_manual_lean_in, -phiMax, phiMax);
+            // 現在の重力と横加速度(ローリングモーメント)の合成力角 θ_force と 脚角 θ1 の整合軸
+            float theta_force = Mathf.Atan2(s.a_c, cfg.g);
+            float sameDirForce = SoftPlus(rollSignSmooth * theta_force);
+            float theta_straight_axis = Mathf.Lerp(s.theta1, rollSignSmooth * SoftMin(absTheta1, SoftMax(absTheta1 * 0.75f, sameDirForce)), 0.35f * (1.0f - midNorm));
+
+            // (A) 中立基準線(midNorm=0)で鉛直(φ = θ1)、Lean-in line(midNorm=1)でストレート内倒(φ = 0)
+            float phi_mid_zone = s.theta1 - midNorm * theta_straight_axis;
+
+            // (B) 中立基準線より下(effLeanOut > 0)のときのみ、鉛直(φ = θ1)を超えて頭を腰より外側へ出す
+            float activeTurnDir = SmoothSign(s.theta1 + 0.12f * s.u_shift_filtered, 8.0f * Mathf.Deg2Rad);
+            float phi_extra_lean_out = effLeanOut * (s.theta1 * cfg.trunkLeanOutRatio + activeTurnDir * (phiMax * 0.45f) * (1.0f - deepRollFactor * 0.4f));
+
+            // (C) Lean-in line より上(leanInNorm > 0)のとき、ストレート内倒(φ = 0)を超えてさらに内倒させる
+            float leanInDir = SmoothSign(s.theta1 + 0.35f * s.u_shift_filtered, 0.04f);
+            float phi_extra_lean_in = -leanInNorm * leanInDir * phiInMax;
+
+            float phi_target = (1.0f - gReset) * AnalyticClamp(
+                phi_mid_zone + phi_extra_lean_out + phi_extra_lean_in - input.phi_lock_cmd,
+                -phiMax, phiMax
+            );
+
             s.theta2_ref = s.theta1 - phi_target;
             s.y_CoM_ref = L1 * sin1 + L2 * Mathf.Sin(s.theta2_ref);
             s.z_CoM_ref = SoftMax(0.18f, L1 * cos1 + L2 * Mathf.Cos(s.theta2_ref));
@@ -273,29 +308,36 @@ namespace SkyTechSimulator
             s.dy_cmd = Mathf.Lerp(AnalyticClamp(dy_desired, s.dy_min_torque, s.dy_max_torque), dy_desired, forceOverride);
             float delta_theta1_cmd = Mathf.Asin(AnalyticClamp(sin1 + s.dy_cmd / L_eff, -0.99f, 0.99f)) - s.theta1;
 
-            float chi_up = AnalyticClamp01(SoftPlus(-SmoothSign(s.theta1, 8.0f * Mathf.Deg2Rad) * SmoothSign(s.u_shift_filtered, 0.15f)));
-            float shallowAngleGate = 1.0f - AnalyticStep(Mathf.Abs(s.theta1), 18.0f * Mathf.Deg2Rad, 8.0f * Mathf.Deg2Rad);
+            float chi_up = oppositeInputGate;
+            float shallowAngleGate = 1.0f - AnalyticStep(absTheta1, 18.0f * Mathf.Deg2Rad, 8.0f * Mathf.Deg2Rad);
 
-            // 2. 下肢伸縮運動方程式 (l1, dl1)
+            // =========================================================================
+            // 2. 下肢伸縮運動方程式 (l1, dl1) ＆ 頭頂高さ維持のマリオネット張力補償
+            // =========================================================================
             EvaluateLegBiomechanics(s.l1, cfg, out s.s_rom, out s.knee_flex_deg, out s.knee_int_deg, out s.posture_force_ratio, out float F_iso, out float v_max_eff, out s.P_leg_peak_avail);
-
-            float pHill = SoftMax(1.0f, cfg.hillPowerExponent);
-            float fvFactor = 1.0f - Mathf.Pow(AnalyticClamp(SoftPlus(s.dl1) / v_max_eff, 0.0f, 0.999f), pHill) + 0.15f * AnalyticClamp01(SoftPlus(-s.dl1) / 1.50f);
-            float returnPushBoost = AnalyticClamp01(inwardReturnRate / 2.5f) * AnalyticStep(Mathf.Abs(s.theta1), 10.0f * Mathf.Deg2Rad, 5.0f * Mathf.Deg2Rad);
-            float u_norm = AnalyticClamp01(SoftMax(input.u_ext_norm, 0.65f * returnPushBoost * (1.0f - leanOutNorm)));
-            float u_flex = AnalyticClamp01(input.u_flex_norm);
-
-            s.u_ext_actual = u_norm * (1.0f - u_flex) * F_iso * fvFactor * AnalyticClamp01((cfg.l_max - s.l1) / 0.025f) * AnalyticClamp01(s.stamina / 20.0f);
 
             float dropHold = cfg.supportDropFromMaxMeters;
             float hasTargetGate = AnalyticStep(input.l1_target, 0.05f, 0.015f);
-            float keyHold = Mathf.Lerp(Mathf.Lerp(cfg.l_max - dropHold, cfg.l_max, u_norm), cfg.l_min, u_flex);
-            float l_hold = Mathf.Lerp(keyHold, AnalyticClamp(input.l1_target, cfg.l_min, cfg.l_max), hasTargetGate);
+            float u_flex = AnalyticClamp01(input.u_flex_norm);
+            float baseKeyHold = Mathf.Lerp(Mathf.Lerp(neutralL1, cfg.l_max, AnalyticClamp01(input.u_ext_norm)), cfg.l_min, u_flex);
+            float baseDesiredL1 = Mathf.Lerp(baseKeyHold, AnalyticClamp(input.l1_target, cfg.l_min, cfg.l_max), hasTargetGate);
+
+            float hammockEngage = (1.0f - midNorm) * leanOutGate * (1.0f - leanInNorm);
+            float curHeadZ = s.l1 * cos1 + headReach * Mathf.Cos(s.theta1 - s.phi);
+            float targetHeadZ = baseDesiredL1 + headReach * Mathf.Cos(s.theta2_ref);
+            float headHeightDeficit = SoftPlus(targetHeadZ - curHeadZ) * hammockEngage * (1.0f - u_flex);
+            float puppetLiftL1 = AnalyticClamp(headHeightDeficit * 0.65f / SoftMax(0.40f, cosAbsTheta1), 0.0f, cfg.l_max - baseDesiredL1);
+            float l_hold = AnalyticClamp(baseDesiredL1 + puppetLiftL1, cfg.l_min, cfg.l_max);
+
+            float pHill = SoftMax(1.0f, cfg.hillPowerExponent);
+            float fvFactor = 1.0f - Mathf.Pow(AnalyticClamp(SoftPlus(s.dl1) / v_max_eff, 0.0f, 0.999f), pHill) + 0.15f * AnalyticClamp01(SoftPlus(-s.dl1) / 1.50f);
+            float returnPushBoost = AnalyticClamp01(inwardReturnRate / 2.5f) * AnalyticStep(absTheta1, 10.0f * Mathf.Deg2Rad, 5.0f * Mathf.Deg2Rad);
+            float puppetExtDrive = AnalyticClamp01((l_hold - s.l1) / 0.08f) * hammockEngage;
+            float u_norm = AnalyticClamp01(SoftMax(input.u_ext_norm, SoftMax(0.55f * puppetExtDrive, 0.65f * returnPushBoost * (1.0f - effLeanOut))));
+
+            s.u_ext_actual = u_norm * (1.0f - u_flex) * F_iso * fvFactor * AnalyticClamp01((cfg.l_max - s.l1) / 0.025f) * AnalyticClamp01(s.stamina / 20.0f);
 
             float phi_support = ComputeSelfWeightSupportFactor(s.l1, cfg.l_max, cfg);
-            float absTheta1 = SoftMin(Mathf.Abs(s.theta1), 82f * Mathf.Deg2Rad);
-            float cosAbsTheta1 = SoftMax(0.15f, Mathf.Cos(absTheta1));
-            float sinAbsTheta1 = Mathf.Sin(absTheta1);
             float absPsi = Mathf.Abs(s.Psi_CoM);
 
             s.F_compress = SoftMax(0.1f * mg, mg * (Mathf.Cos(absPsi) + (Mathf.Abs(s.a_c) / cfg.g) * Mathf.Sin(absPsi)));
@@ -342,11 +384,14 @@ namespace SkyTechSimulator
             s.F_lat_step = weightGate * ((s.u_ext_actual + cfg.M * SoftPlus(ddl1)) * sinAbsTheta1 + cfg.M * Mathf.Abs(s.a_c) * Mathf.Sin(absPsi));
             s.F_leg = SoftMax(F_vert_pos, F_vert_pos * cosAbsTheta1 + s.F_lat_step * sinAbsTheta1);
 
+            // =========================================================================
             // 3. 屋内レール式キャリッジ駆動 ＆ 自己整合カービング物理モデル
+            // =========================================================================
             float effectiveRollRate = s.omega1 + 0.35f * (rollError / SoftMax(0.06f, tauShift));
-            float rollDirSign = SmoothSign(s.theta1, 6.0f * Mathf.Deg2Rad);
-            float sigma_phase = rollDirSign * SmoothSign(effectiveRollRate, 0.65f);
-            float intentionalRollIn = AnalyticClamp01(SoftPlus(SmoothSign(theta1_des, 2.0f * Mathf.Deg2Rad) * rollError) / (18.0f * Mathf.Deg2Rad));
+            float sigma_phase = rollSignSmooth * SmoothSign(effectiveRollRate, 0.65f);
+
+            float rollInDeficit = SoftPlus(SmoothSign(theta1_des, 2.0f * Mathf.Deg2Rad) * rollError);
+            float intentionalRollIn = leanOutGate * AnalyticClamp01(rollInDeficit / (18.0f * Mathf.Deg2Rad));
 
             float sigma_in = AnalyticClamp01(SoftPlus(sigma_phase)) * AnalyticStep(absTheta1, 15.0f * Mathf.Deg2Rad, 6.0f * Mathf.Deg2Rad);
             float sigma_out = AnalyticClamp01(SoftPlus(-sigma_phase));
@@ -366,7 +411,7 @@ namespace SkyTechSimulator
 
             float carveEngageEnvelope = AnalyticStep(absTheta1, 11.0f * Mathf.Deg2Rad, 5.5f * Mathf.Deg2Rad);
             float eqScale = Mathf.Lerp(0.55f, 1.08f, carveEngageEnvelope) * (1.0f - 0.55f * intentionalRollIn);
-            float G_com_equilibrium = Mathf.Lerp(G_eq, sin1 / cosAbsTheta1, 0.45f) * (eqScale + 0.18f * angulationAlignment + 0.30f * leanOutNorm) * speedScale;
+            float G_com_equilibrium = Mathf.Lerp(G_eq, sin1 / cosAbsTheta1, 0.45f) * (eqScale + 0.18f * angulationAlignment + 0.30f * effLeanOut) * speedScale;
 
             float howeBlend = AnalyticClamp01(0.12f + 0.55f * AnalyticStep(absTheta1, 22.0f * Mathf.Deg2Rad, 10.0f * Mathf.Deg2Rad) * (1.0f - 0.50f * intentionalRollIn) + 0.18f * angulationAlignment);
             float biteRatio = AnalyticClamp01(absTheta1 / SoftMax(0.5f * Mathf.Deg2Rad, cfg.carriageDeadzoneRad));
@@ -404,7 +449,7 @@ namespace SkyTechSimulator
             float railScaleNorm = SoftMax(0.5f, cfg.railScale / 4.87f);
             float v_c_sym = 1.85f * (float)Math.Tanh(rawTanDrive / 1.85f) * cfg.g * 1.15f * railScaleNorm * (0.85f + 0.55f * sinRoll * sinRoll);
 
-            float boundedFallingRate = 0.45f * (float)Math.Tanh((rollDirSign * SoftPlus(rollDirSign * s.omega1)) / 0.45f);
+            float boundedFallingRate = 0.45f * (float)Math.Tanh((rollSignSmooth * SoftPlus(rollSignSmooth * s.omega1)) / 0.45f);
             float v_c_capture_lead = cfg.capturePointLeadGain * (1.0f - 0.80f * intentionalRollIn) * s.z_CoM * boundedFallingRate * railScaleNorm;
             s.v_c_target = SolveFirstOrderExact(s.v_c_target, v_c_sym * (1.0f - 0.08f * sigma_in + 0.22f * sigma_out) + v_c_capture_lead, 0.035f, safeDt);
 
@@ -438,19 +483,22 @@ namespace SkyTechSimulator
 
             float a_pivot_total = s.a_c + Mathf.Lerp(0.30f, 0.55f, shallowAngleGate * shiftActivity) * AnalyticClamp(ddx_c, -6.5f, 6.5f);
 
+            // =========================================================================
             // 4. 2リンク回転運動方程式 ＆ 股関節サーボ
+            // =========================================================================
             float tau_gravity = (1.0f - gReset) * mg * s.y_CoM * (1.0f + 0.15f * sigma_in * Mathf.Sin(cfg.alphaRad));
             float z_CoM_cuff = Mathf.Lerp(s.z_CoM, s.R_CoM, AnalyticClamp01(cfg.beta_cuff) * sinAbsTheta1 * sinAbsTheta1);
             float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total * z_CoM_cuff;
-            float tau_switch_push = -(1.0f - gReset) * sigma_out * (1.0f - leanOutNorm) * SoftMax(0.5f, cfg.extVelocityRightingGain) * mg * 0.28f * sin1;
+
+            float switchDriveScale = 0.55f + 0.75f * oppositeInputGate;
+            float tau_roll_drive = (1.0f - gReset) * weightGate * SoftMax(0.5f, cfg.comShiftRollDriveGain) * switchDriveScale * mg * 0.35f * rollError;
+            float tau_switch_push = -(1.0f - gReset) * sigma_out * (1.0f - effLeanOut) * SoftMax(0.5f, cfg.extVelocityRightingGain) * mg * 0.28f * sin1;
 
             float pendulumCritDamping = 2.0f * Mathf.Sqrt(s.I_eff * mg * SoftMax(0.30f, s.z_CoM));
             float coContractGain = AnalyticClamp(cfg.adaptiveDampingBoost, 0.5f, 5.0f);
-            float rollReleaseFactor = 1.0f - 0.72f * intentionalRollIn;
+            float rollReleaseFactor = (1.0f - 0.72f * intentionalRollIn) * (1.0f - 0.55f * oppositeInputGate);
             float autoImpedanceDamping = pendulumCritDamping * (0.20f * rollReleaseFactor + 0.28f * coContractGain * (1.0f - shiftActivity) + 0.18f * coContractGain * (1.0f - AnalyticClamp01(Mathf.Abs(du_shift_rate) / 2.0f)) * rollReleaseFactor);
             float totalRollDamping = SoftMax(cfg.gamma_roll * rollReleaseFactor, autoImpedanceDamping) + SoftMax(60.0f, cfg.gamma_quad) * 0.30f * Mathf.Abs(s.omega1) * rollReleaseFactor;
-
-            float ddtheta1_est = (tau_gravity + tau_inertial_com + tau_switch_push - weightGate * totalRollDamping * s.omega1) / s.I_eff;
 
             // A. 股関節相対角 phi(t)
             float theta2_cur = s.theta1 - s.phi;
@@ -459,36 +507,52 @@ namespace SkyTechSimulator
             float tau_hip_load = m2_l2 * (cfg.g * Mathf.Sin(theta2_cur) - a_hip_inertial * Mathf.Cos(theta2_cur));
             float tau_hip_ff = (1.0f - gReset) * m2_l2 * (cfg.g * Mathf.Sin(theta2_target) - a_hip_inertial * Mathf.Cos(theta2_target));
 
-            float kp_hip_eff = SoftMax(850.0f, cfg.kp_hip) * (1.0f + 0.85f * shiftActivity + 0.65f * chi_up + 0.55f * deepRollFactor);
-            float dphi_target = (1.0f - gReset) * (leanOutNorm * s.omega1 - du_shift_rate * (phiMax * directSteerScale));
+            float kp_hip_eff = SoftMax(950.0f, cfg.kp_hip) * (1.0f + 0.85f * shiftActivity + 0.65f * chi_up + 0.65f * hammockEngage);
+            // 中立基準線(midNorm=0)では dphi_target = omega1 となって上体の鉛直(θ2=0)を厳密に維持し、Lean-in line(midNorm=1)では 0(ストレート追従)になる
+            float postureOmegaFollow = (1.0f - midNorm) * (1.0f - leanInNorm) + 0.35f * effLeanOut;
+            float dphi_target = (1.0f - gReset) * postureOmegaFollow * s.omega1;
             float dphi_error = s.dphi - dphi_target;
 
             float hipCoContraction = 1.0f + 0.35f * cfg.adaptiveDampingBoost * (1.0f - 0.5f * shiftActivity) + 0.25f * cfg.adaptiveDampingBoost * AnalyticClamp01(Mathf.Abs(dphi_error) / SoftMax(0.05f, cfg.coContractionVelThreshold));
-            float kd_hip_eff = SoftMax(cfg.kd_hip, 1.9f * Mathf.Sqrt(I2_hip * kp_hip_eff) * hipCoContraction);
+            float kd_hip_eff = SoftMax(cfg.kd_hip, 1.95f * Mathf.Sqrt(I2_hip * kp_hip_eff) * hipCoContraction);
 
             float I_couple = I2_hip + m2_l2 * s.l1 * cosPhi;
             float tau_hip_pd = kp_hip_eff * (phi_target - s.phi) - kd_hip_eff * dphi_error;
-            s.tau_hip_steer = tau_hip_ff + (1.0f - gReset) * (AnalyticClamp(tau_hip_pd, -tau_hip_avail_neg * 1.5f, tau_hip_avail_pos * 1.5f) + I_couple * leanOutNorm * ddtheta1_est);
+            s.tau_hip_steer = tau_hip_ff + (1.0f - gReset) * AnalyticClamp(tau_hip_pd, -tau_hip_avail_neg * 1.5f, tau_hip_avail_pos * 1.5f);
+
+            // 中立基準線より上(effLeanOut == 0)では、外向傾側の上限を鉛直(φ = θ1)に制限し、頭が腰より外側に出るのを物理的に防止
+            float lockAllowance = Mathf.Abs(input.phi_lock_cmd);
+            float posVerticalCap = SoftMax(0.0f, s.theta1) + lockAllowance;
+            float negVerticalCap = SoftMin(0.0f, s.theta1) - lockAllowance;
+            float dynMaxPhi = Mathf.Lerp(SoftMin(phiMax, posVerticalCap), phiMax, effLeanOut);
+            float dynMinPhi = Mathf.Lerp(SoftMax(-phiMax, negVerticalCap), -phiMax, effLeanOut);
+            if (s.theta1 >= 0.0f) dynMinPhi = -phiMax;
+            else                  dynMaxPhi =  phiMax;
 
             float tau_hip_coriolis = -m2_l2 * (2.0f * s.dl1 * s.omega1 * cosPhi + s.l1 * s.omega1 * s.omega1 * sinPhi);
             SolveSecondOrderBoundedExact(
                 ref s.phi, ref s.dphi, out float ddphi,
                 0.0f, (gReset * 900.0f) / I2_hip, (SoftMax(25.0f, cfg.kd_hip_steer) + gReset * 160.0f) / (2.0f * I2_hip),
-                (s.tau_hip_steer - (1.0f - gReset) * (tau_hip_load - tau_hip_coriolis)) / I2_hip, -phiMax, phiMax, safeDt
+                (s.tau_hip_steer - (1.0f - gReset) * (tau_hip_load - tau_hip_coriolis)) / I2_hip, dynMinPhi, dynMaxPhi, safeDt
             );
 
             // B. 下部リンク角 theta1(t)
-            float reactionScale = Mathf.Lerp(AnalyticClamp(cfg.hipReactionGain, 0.35f, 1.0f), 1.0f, shiftActivity);
-            float tau_hip_inertial_reaction = (1.0f - gReset) * reactionScale * (I_couple * AnalyticClamp(ddphi - leanOutNorm * ddtheta1_est, -25.0f, 25.0f) + m2_l2 * s.l1 * sinPhi * s.dphi * s.dphi);
+            float reactionScale = Mathf.Lerp(AnalyticClamp(cfg.hipReactionGain, 0.35f, 1.0f), 1.0f, shiftActivity) * (1.0f - 0.65f * hammockEngage);
+            float tau_hip_inertial_reaction = (1.0f - gReset) * reactionScale * (I_couple * AnalyticClamp(ddphi, -20.0f, 20.0f) + m2_l2 * s.l1 * sinPhi * s.dphi * s.dphi);
             float dI_eff_dt = 2.0f * half_dI_dl1 * s.dl1 + dI_dphi * s.dphi;
 
             SolveSecondOrderBoundedExact(
                 ref s.theta1, ref s.omega1, out _,
                 0.0f, (gReset * 850.0f) / s.I_eff, (weightGate * totalRollDamping + SoftMax(0.0f, dI_eff_dt) + gReset * 160.0f) / (2.0f * s.I_eff),
-                (tau_gravity + tau_inertial_com + tau_switch_push + tau_hip_inertial_reaction) / s.I_eff, -halfPi, halfPi, safeDt
+                (tau_gravity + tau_inertial_com + tau_roll_drive + tau_switch_push + tau_hip_inertial_reaction) / s.I_eff, -halfPi, halfPi, safeDt
             );
 
-            if (gReset < 0.5f) s.phi = AnalyticClamp(s.phi, -phiMax, phiMax);
+            if (gReset < 0.5f)
+            {
+                float postMaxPhi = (s.theta1 >= 0.0f) ? Mathf.Lerp(SoftMin(phiMax, SoftMax(0.0f, s.theta1) + lockAllowance), phiMax, effLeanOut) : phiMax;
+                float postMinPhi = (s.theta1 <  0.0f) ? Mathf.Lerp(SoftMax(-phiMax, SoftMin(0.0f, s.theta1) - lockAllowance), -phiMax, effLeanOut) : -phiMax;
+                s.phi = AnalyticClamp(s.phi, postMinPhi, postMaxPhi);
+            }
 
             s.P_hip_steer = (1.0f - gReset) * Mathf.Abs(s.tau_hip_steer * s.dphi);
             s.phi_bend = (1.0f - gReset) * (s.phi - phi_target);
