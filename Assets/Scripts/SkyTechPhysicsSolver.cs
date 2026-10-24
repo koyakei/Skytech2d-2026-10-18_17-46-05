@@ -233,12 +233,16 @@ namespace SkyTechSimulator
             float forceOverride = cfg.mouseForceOverrideRatio * shiftActivity;
 
             float maxTargetRollRad = SoftMin(72.0f * Mathf.Deg2Rad, cfg.theta_bootOutRad - 4.0f * Mathf.Deg2Rad);
-            float mouseTargetTheta1 = SmoothSign(s.u_shift_filtered, 0.02f) * Mathf.Pow(Mathf.Abs(s.u_shift_filtered), 0.82f) * maxTargetRollRad;
+            // 【修正1】中央(0)付近で急激に変化しないよう、べき乗(Pow 0.82)と狭いSmoothSignを廃止し、滑らかな線形＋緩やかな非線形にする
+            float u_shift_abs = Mathf.Abs(s.u_shift_filtered);
+            float smoothFactor = u_shift_abs / Mathf.Sqrt(u_shift_abs * u_shift_abs + 0.015f); // 0付近で傾きが緩やかになる連続関数
+            float mouseTargetTheta1 = s.u_shift_filtered * Mathf.Lerp(0.85f, 1.0f, smoothFactor) * maxTargetRollRad;
+            
             float theta1_des = activeGate * AnalyticClamp(mouseTargetTheta1 + input.phi_lock_cmd, -maxTargetRollRad, maxTargetRollRad);
             float rollError = theta1_des - s.theta1;
 
-            float rollSignSmooth = SmoothSign(s.theta1, 6.0f * Mathf.Deg2Rad);
-            float shiftSignSmooth = SmoothSign(s.u_shift_filtered, 0.06f);
+            float rollSignSmooth = SmoothSign(s.theta1, 8.0f * Mathf.Deg2Rad);
+            float shiftSignSmooth = SmoothSign(s.u_shift_filtered, 0.12f);
             float oppositeInputGate = AnalyticClamp01(SoftPlus(-rollSignSmooth * shiftSignSmooth));
             float leanOutGate = 1.0f - oppositeInputGate;
 
@@ -251,16 +255,40 @@ namespace SkyTechSimulator
             float neutralL1 = AnalyticClamp(cfg.l_max - cfg.supportDropFromMaxMeters, cfg.l_min, cfg.l_max);
             float headReach = 1.55f * cfg.l2;
 
+            // -------------------------------------------------------------------------
+            // 【修正】中立基準線(midNorm=0) ～ Lean-inライン(midNorm=1) における姿勢マッピング
+            // 「合力(重力+遠心力)の釣り合いよりも外(外傾側)だが、鉛直よりは必ずターン内側」に収める
+            // -------------------------------------------------------------------------
+            
+            // 1. 重力と横方向慣性力(遠心力)の釣り合い角 theta_force
             float theta_force = Mathf.Atan2(s.a_c, cfg.g);
-            float sameDirForce = SoftPlus(rollSignSmooth * theta_force);
-            float theta_straight_axis = Mathf.Lerp(s.theta1, rollSignSmooth * SoftMin(absTheta1, SoftMax(absTheta1 * 0.75f, sameDirForce)), 0.35f * (1.0f - midNorm));
+            
+            // 現在のターン方向(s.theta1)と同じ向きの釣り合い角成分を取り出す（逆向きや過大な値を防ぐ）
+            float turnSign = SmoothSign(s.theta1, 1.5f * Mathf.Deg2Rad);
+            float absForceAngle = SoftPlus(turnSign * theta_force);
+            
+            // Lean-inライン(midNorm = 1)での目標体幹角:
+            // 基本はストレート(s.theta1)〜力の釣り合い角(theta_force)とし、板の傾きを超えない範囲に収める
+            float theta2_at_leanInLine = turnSign * SoftMin(absTheta1, SoftMax(absTheta1 * 0.85f, absForceAngle));
 
-            float phi_mid_zone = s.theta1 - midNorm * theta_straight_axis;
-            float activeTurnDir = SmoothSign(s.theta1 + 0.12f * s.u_shift_filtered, 8.0f * Mathf.Deg2Rad);
-            float phi_extra_lean_out = effLeanOut * (s.theta1 * cfg.trunkLeanOutRatio + activeTurnDir * (phiMax * 0.45f) * (1.0f - deepRollFactor * 0.4f));
+            // 中立基準線(midNorm = 0)での目標体幹角:
+            // 完全な鉛直(0°)よりもわずかにターン内側(例えば板の傾きの10%内側)をキープさせることで、
+            // Lean-inラインから下がったときに「釣り合いよりは外だが、鉛直よりは内側（上の重心が下の重心より必ず内側）」を保証する
+            float theta2_at_centerLine = s.theta1 * 0.10f;
 
-            float leanInDir = SmoothSign(s.theta1 + 0.35f * s.u_shift_filtered, 0.04f);
-            float phi_extra_lean_in = -leanInNorm * leanInDir * phiInMax;
+            // midNorm (0..1) で [鉛直より内側] ～ [釣り合い角(ストレート)] の間を滑らかに補間
+            float theta2_mid_target = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, midNorm);
+
+            // 股関節の相対角 phi = theta1 - theta2 に変換
+            // これにより midNorm = 0..1 の全域で 0 <= phi <= 0.9 * theta1 となり、
+            // 体幹が鉛直を超えてターン外側へ倒れることがなくなる
+            float phi_mid_zone = s.theta1 - theta2_mid_target;
+
+            // 2. 中立基準線より下 (leanOutNorm > 0) に入ったときのみ、鉛直を超えてさらに外傾(リーンアウト)させる
+            float phi_extra_lean_out = leanOutNorm * (theta1_des * cfg.trunkLeanOutRatio + s.u_shift_filtered * (phiMax * 0.45f) * (1.0f - deepRollFactor * 0.4f));
+
+            // 3. Lean-inラインより上 (leanInNorm > 0) に入ったときのみ、釣り合い角を超えてさらに内倒(リーンイン)させる
+            float phi_extra_lean_in = -leanInNorm * s.u_shift_filtered * phiInMax;
 
             float phi_target = (1.0f - gReset) * AnalyticClamp(
                 phi_mid_zone + phi_extra_lean_out + phi_extra_lean_in - input.phi_lock_cmd,
@@ -467,9 +495,10 @@ namespace SkyTechSimulator
             float z_CoM_cuff = Mathf.Lerp(s.z_CoM, s.R_CoM, AnalyticClamp01(cfg.beta_cuff) * sinAbsTheta1 * sinAbsTheta1);
             float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total * z_CoM_cuff;
 
-            float switchDriveScale = 0.55f + 0.75f * oppositeInputGate;
-            float tau_roll_drive = (1.0f - gReset) * weightGate * SoftMax(0.5f, cfg.comShiftRollDriveGain) * switchDriveScale * mg * 0.35f * rollError;
-            float tau_switch_push = -(1.0f - gReset) * sigma_out * (1.0f - effLeanOut) * SoftMax(0.5f, cfg.extVelocityRightingGain) * mg * 0.28f * sin1;
+            // 【修正】外部からの人工的なロール駆動トルク直接加算を廃止
+            // float switchDriveScale = 0.55f + 0.75f * oppositeInputGate;
+            // float tau_roll_drive = (1.0f - gReset) * weightGate * SoftMax(0.5f, cfg.comShiftRollDriveGain) * switchDriveScale * mg * 0.35f * rollError;
+            // float tau_switch_push = -(1.0f - gReset) * sigma_out * (1.0f - effLeanOut) * SoftMax(0.5f, cfg.extVelocityRightingGain) * mg * 0.28f * sin1;
 
             float pendulumCritDamping = 2.0f * Mathf.Sqrt(s.I_eff * mg * SoftMax(0.30f, s.z_CoM));
             float coContractGain = AnalyticClamp(cfg.adaptiveDampingBoost, 0.5f, 5.0f);
@@ -496,13 +525,17 @@ namespace SkyTechSimulator
             float tau_hip_pd = kp_hip_eff * (phi_target - s.phi) - kd_hip_eff * dphi_error;
             s.tau_hip_steer = tau_hip_ff + (1.0f - gReset) * AnalyticClamp(tau_hip_pd, -tau_hip_avail_neg * 1.5f, tau_hip_avail_pos * 1.5f);
 
+            // -------------------------------------------------------------------------
+            // 【修正4】セクション4・A 内の dynMaxPhi / dynMinPhi 計算部分（置き換え）
+            // -------------------------------------------------------------------------
             float lockAllowance = Mathf.Abs(input.phi_lock_cmd);
-            float posVerticalCap = SoftMax(0.0f, s.theta1) + lockAllowance;
-            float negVerticalCap = SoftMin(0.0f, s.theta1) - lockAllowance;
-            float dynMaxPhi = Mathf.Lerp(SoftMin(phiMax, posVerticalCap), phiMax, effLeanOut);
-            float dynMinPhi = Mathf.Lerp(SoftMax(-phiMax, negVerticalCap), -phiMax, effLeanOut);
-            if (s.theta1 >= 0.0f) dynMinPhi = -phiMax;
-            else                  dynMaxPhi =  phiMax;
+            // 板の実角度(s.theta1)だけでなく目標角度(theta1_des)も許容幅に含めることで、
+            // 中立停止からのターン始動時に外傾がブロックされるのを防ぎ、かつ中央通過時のif分岐による不連続ジャンプを廃止する
+            float allowPos = SoftMax(0.0f, SoftMax(s.theta1, theta1_des)) + lockAllowance + 15.0f * Mathf.Deg2Rad;
+            float allowNeg = SoftMin(0.0f, SoftMin(s.theta1, theta1_des)) - lockAllowance - 15.0f * Mathf.Deg2Rad;
+            
+            float dynMaxPhi = Mathf.Lerp(SoftMin(phiMax, allowPos), phiMax, leanOutNorm + leanInNorm);
+            float dynMinPhi = Mathf.Lerp(SoftMax(-phiMax, allowNeg), -phiMax, leanOutNorm + leanInNorm);
 
             float tau_hip_coriolis = -m2_l2 * (2.0f * s.dl1 * s.omega1 * cosPhi + s.l1 * s.omega1 * s.omega1 * sinPhi);
             SolveSecondOrderBoundedExact(
@@ -519,14 +552,13 @@ namespace SkyTechSimulator
             SolveSecondOrderBoundedExact(
                 ref s.theta1, ref s.omega1, out _,
                 0.0f, (gReset * 850.0f) / s.I_eff, (weightGate * totalRollDamping + SoftMax(0.0f, dI_eff_dt) + gReset * 160.0f) / (2.0f * s.I_eff),
-                (tau_gravity + tau_inertial_com + tau_roll_drive + tau_switch_push + tau_hip_inertial_reaction) / s.I_eff, -halfPi, halfPi, safeDt
+                (tau_gravity + tau_inertial_com + tau_hip_inertial_reaction) / s.I_eff, -halfPi, halfPi, safeDt
             );
 
             if (gReset < 0.5f)
             {
-                float postMaxPhi = (s.theta1 >= 0.0f) ? Mathf.Lerp(SoftMin(phiMax, SoftMax(0.0f, s.theta1) + lockAllowance), phiMax, effLeanOut) : phiMax;
-                float postMinPhi = (s.theta1 <  0.0f) ? Mathf.Lerp(SoftMax(-phiMax, SoftMin(0.0f, s.theta1) - lockAllowance), -phiMax, effLeanOut) : -phiMax;
-                s.phi = AnalyticClamp(s.phi, postMinPhi, postMaxPhi);
+                // 【修正5】事後クランプもif分岐を廃止して滑らかに制限
+                s.phi = AnalyticClamp(s.phi, dynMinPhi, dynMaxPhi);
             }
 
             s.P_hip_steer = (1.0f - gReset) * Mathf.Abs(s.tau_hip_steer * s.dphi);
