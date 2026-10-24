@@ -111,7 +111,7 @@ namespace SkyTechSimulator
         public float carriagePushbackGain = 0.30f;
         public float skidRecoveryTau = 0.12f;
         public float z_H_min = 0.12f;
-        public float theta_bootOutDeg = 78.0f;
+        public float theta_bootOutDeg = 90.0f;
 
         [Header("8. Extension Righting & Tuck Centering Return")]
         public float extRightingTorqueGain = 0.45f;
