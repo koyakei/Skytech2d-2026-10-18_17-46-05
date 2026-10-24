@@ -447,33 +447,21 @@ namespace SkyTechSimulator
             float maxLambda = Mathf.Lerp(1.0f, SoftMax(1.2f, cfg.lambda_max), AnalyticClamp01((s.P_leg_ext + s.F_lat_step * v_y_ext) / 600.0f));
             s.lambda_sustain = AnalyticClamp(Mathf.Pow(AnalyticClamp(loadRatio, 0.85f, 1.8f), cfg.loadSustainPower_q), 0.92f, maxLambda);
 
-            float minSkidRad = SoftMax(22.0f, cfg.skidMinAngleDeg) * Mathf.Deg2Rad;
-            float refSkidRad = SoftMax(minSkidRad + 12.0f * Mathf.Deg2Rad, cfg.skidRefAngleDeg * Mathf.Deg2Rad);
-            float phi_angle = AnalyticStep(absTheta1, minSkidRad, 0.25f * minSkidRad) * Mathf.Pow(sinAbsTheta1 / SoftMax(0.25f, Mathf.Sin(refSkidRad)), cfg.snowAngleVulnerabilityExp);
-
-            float limitVertG = SoftMax(1.2f, cfg.snowFailureVerticalForceG) * Mathf.Lerp(1.0f, cosAbsTheta1, 0.40f);
-            float F_lat_cent_demand = mg * Mathf.Abs(s.G_base) * s.lambda_sustain;
-            float combinedLoadG = (SoftMin(F_vert_pos, s.F_compress + 0.65f * s.u_ext_actual) + 0.45f * F_lat_cent_demand) / mg;
-            float sigma_force = SoftPlus(combinedLoadG - 1.10f * cosAbsTheta1) / SoftMax(0.50f, limitVertG);
-
-            s.snow_stress_ratio = SolveFirstOrderExact(s.snow_stress_ratio, phi_angle * (sigma_force * sigma_force), 0.06f, safeDt);
-            float skidOnset = AnalyticStep(s.snow_stress_ratio, 1.0f, 0.08f);
-            s.skid_intensity = SolveFirstOrderExact(s.skid_intensity, skidOnset * AnalyticClamp01(0.50f + 0.35f * (s.snow_stress_ratio - 1.0f)), Mathf.Lerp(SoftMax(0.06f, cfg.skidRecoveryTau), 0.05f, skidOnset), safeDt);
+            // 雪面の挫屈（せん断破壊）を無効化し、どれだけ強く踏み込んでも100%エッジが噛み続けるように固定
+            s.snow_stress_ratio = 0.0f;
+            s.skid_intensity = 0.0f;
+            s.skid_pushback_force = 0.0f;
 
             // キャリッジ固有質量を廃止（inertiaMassRatio = 1.0）し、雪面からの反力を直接身体質量 M に対する実加速度へ変換
             float viableGate = AnalyticStep(s.z_H, cfg.z_H_min, 2e-3f) * AnalyticStep(cfg.theta_bootOutRad, absTheta1, 2e-3f);
-            float safeSkidGrip = SoftMax(0.55f, cfg.skidGripMultiplier);
-            float carvingRetention = Mathf.Lerp(1.0f, safeSkidGrip, AnalyticClamp01(s.skid_intensity));
-            float gripFactor = viableGate * weightGate * carvingRetention;
+            float carvingRetention = 1.0f;
+            float gripFactor = viableGate * weightGate;
 
             s.v_c_recoil_max = v_y_ext;
 
             float F_carve = cfg.M * (s.G_base * cfg.g) * s.lambda_sustain * gripFactor;
-            float F_camber_rebound = weightGate * sigma_out * 0.22f * s.F_leg * sin1 * carvingRetention * speedScale;
-            float activeExtDrive = weightGate * Mathf.Lerp(-1.0f, 1.0f, sigma_out) * s.u_ext_actual * sin1 * (1.0f - s.skid_intensity) * 0.35f;
-
-            float dynamicFootForce = ((s.P_leg_ext / SoftMax(0.3f, v_max_eff)) + 0.20f * F_lat_cent_demand) * sinAbsTheta1;
-            s.skid_pushback_force = -SmoothSign(s.y_CoM + 0.1f * s.theta1, 2e-3f) * SoftMin(0.35f, cfg.carriagePushbackGain) * dynamicFootForce * s.skid_intensity;
+            float F_camber_rebound = weightGate * sigma_out * 0.22f * s.F_leg * sin1 * speedScale;
+            float activeExtDrive = weightGate * Mathf.Lerp(-1.0f, 1.0f, sigma_out) * s.u_ext_actual * sin1 * 0.35f;
 
             // 【修正3】Capture-Point先行加速(a_capture_lead)が30度以下の倒れ込みにブレーキをかけないよう、浅い角度・ロールイン時は無効化する
             float boundedFallingRate = 0.45f * (float)Math.Tanh((rollSignSmooth * SoftPlus(rollSignSmooth * s.omega1)) / 0.45f);
