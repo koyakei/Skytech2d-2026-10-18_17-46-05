@@ -514,7 +514,7 @@ namespace SkyTechSimulator
             float effective_y_CoM = s.y_CoM + ankleCopShift;
 
             float tau_gravity = (1.0f - gReset) * mg * effective_y_CoM * (1.0f + 0.15f * sigma_in * Mathf.Sin(cfg.alphaRad));
-            float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total;
+            float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total * s.z_CoM;
 
             float pendulumCritDamping = 2.0f * Mathf.Sqrt(s.I_eff * mg * SoftMax(0.30f, s.z_CoM));
             float coContractGain = AnalyticClamp(cfg.adaptiveDampingBoost, 0.5f, 5.0f);
