@@ -12,18 +12,20 @@ public class SkyTechVisualizer : MonoBehaviour
 
     [Header("=== 理想のマウスリード目印（ペースメーカー）設定 ===")]
     public bool ShowIdealMouseLead = true;
-    [Tooltip("現在のピーク角に対してプラス何度の深さを目指すか")]
-    public float LeadExtraDepthDeg = 6.5f;
-    [Tooltip("位相をどれだけ先回りしてリードするか（ラジアン: 0.45 ≈ 約25度先回り）")]
-    public float LeadPhaseAdvanceRad = 0.45f;
-    [Tooltip("ターンがまだ無い時の初期リズム周期（秒/1往復）")]
-    public float DefaultCyclePeriodSec = 2.4f;
+    [Tooltip("目標とするレール幅の使用率（0.70 = レール全幅の70%を使ってターン）")]
+    [Range(0.40f, 0.90f)] public float TargetRailUsageRatio = 0.70f;
+    [Tooltip("極限ディープターンの基準目標ロール角（度） -> 70度")]
+    [Range(60.0f, 72.0f)] public float IdealDeepTurnEdgeDeg = 70.0f;
+    [Tooltip("マウスの動きをどれだけゆっくり滑らかにリードするか（周期スケール倍率）")]
+    [Range(1.00f, 1.80f)] public float SlowCarvePeriodScale = 1.35f;
+    [Tooltip("位相をどれだけ先回りしてリードするか（ラジアン）")]
+    public float LeadPhaseAdvanceRad = 0.30f;
 
-    private float _measuredHalfTurnSec = 1.2f;
-    private float _turnTimer = 0f;
-    private float _prevThetaSign = 0f;
     private float _pacemakerPhase = 0f;
-    private float _smoothedTargetDeg = 42.0f;
+    private float _smoothedTargetDeg = 70.0f;
+    private float _currentTurnMaxAbsX = 0f;
+    private float _lastTurnPeakAbsX = 0f;
+    private float _prevVelSign = 0f;
 
     private void EnforceVisualizerRanges()
     {
@@ -40,6 +42,7 @@ public class SkyTechVisualizer : MonoBehaviour
     private LineRenderer _puppetStringLine, _apexTargetCircle;
     private LineRenderer _idealLeadOuterRing, _idealLeadInnerCore, _idealLeadOrbitLine, _idealLeadTetherLine;
     private LineRenderer _railLine, _absorberLeft, _absorberRight, _carriageLine, _skiBoardLine;
+    private LineRenderer _railTargetLeftTick, _railTargetRightTick; // 追加: レール幅70%の目標ライン目印
     private LineRenderer _legLine, _trunkLine, _hipJointCircle, _headCircle;
     private LineRenderer _comCircle, _comLine, _lowerComCircle, _upperComCircle, _twoComDistLine;
     private LineRenderer _forceLine, _ghostPeakLine;
@@ -85,7 +88,7 @@ public class SkyTechVisualizer : MonoBehaviour
         cam.orthographic = true;
         float halfRail = (_controller != null && _controller.Config != null) ? _controller.Config.W_rail * 0.5f : 3.60f;
         float aspect = (cam.pixelWidth > 0 && cam.pixelHeight > 0) ? (float)cam.pixelWidth / cam.pixelHeight : (16f / 9f);
-        cam.orthographicSize = Mathf.Max(1.6f, (halfRail + 0.35f) / Mathf.Max(0.5f, aspect));
+        cam.orthographicSize = Mathf.Max(2.6f, (halfRail + 0.35f) / Mathf.Max(0.5f, aspect));
         cam.transform.SetPositionAndRotation(new Vector3(0f, 0.85f, -10f), Quaternion.identity);
         cam.backgroundColor = new Color(0.063f, 0.082f, 0.125f);
         cam.clearFlags = CameraClearFlags.SolidColor;
@@ -102,6 +105,7 @@ public class SkyTechVisualizer : MonoBehaviour
         if (_controller == null || _controller.Config == null) return;
         SimState state = _controller.CurrentState;
         SimInput input = _controller.CurrentInput;
+        UpdateRailGeometry();
         UpdateCenterCrosshairGeometry(input);
         UpdateDynamicGeometry(state, input, _controller.Config);
         UpdateIdealMouseLeadMarker(state, input, _controller.Config);
@@ -118,99 +122,104 @@ public class SkyTechVisualizer : MonoBehaviour
         }
 
         float dt = Mathf.Max(1e-4f, Time.deltaTime);
-        _turnTimer += dt;
 
-        // 1. 現在のターンの切り替え周期（リズム）を自動計測して追従
-        float curSign = Mathf.Abs(state.theta1) > (3.0f * Mathf.Deg2Rad) ? Mathf.Sign(state.theta1) : _prevThetaSign;
-        if (_prevThetaSign != 0f && curSign != _prevThetaSign)
+        // 1. レールの片側幅の70%を目標ストローク振幅 X_target とする
+        float halfRail = cfg.W_rail * 0.5f;
+        float usageRatio = Mathf.Clamp(TargetRailUsageRatio, 0.40f, 0.90f);
+        float targetAmpRailX = halfRail * usageRatio;
+
+        _currentTurnMaxAbsX = Mathf.Max(_currentTurnMaxAbsX, Mathf.Abs(state.x_c));
+        float velSign = Mathf.Abs(state.v_c) > 0.15f ? Mathf.Sign(state.v_c) : _prevVelSign;
+        if (_prevVelSign != 0f && velSign != _prevVelSign)
         {
-            // 有効なターン切り替え時間（0.45秒〜3.0秒）なら移動平均でリズムを更新
-            if (_turnTimer >= 0.45f && _turnTimer <= 3.0f)
+            if (_currentTurnMaxAbsX > 0.5f)
             {
-                _measuredHalfTurnSec = Mathf.Lerp(_measuredHalfTurnSec, _turnTimer, 0.45f);
+                _lastTurnPeakAbsX = Mathf.Lerp(
+                    _lastTurnPeakAbsX > 0.1f ? _lastTurnPeakAbsX : _currentTurnMaxAbsX,
+                    _currentTurnMaxAbsX,
+                    0.5f
+                );
             }
-            _turnTimer = 0f;
+            _currentTurnMaxAbsX = Mathf.Abs(state.x_c);
         }
-        if (curSign != 0f) _prevThetaSign = curSign;
+        if (velSign != 0f) _prevVelSign = velSign;
 
-        float cyclePeriod = Mathf.Clamp(_measuredHalfTurnSec * 2.0f, 1.1f, 4.5f);
-        if (_controller.TurnCount == 0 && _turnTimer > 2.5f) cyclePeriod = DefaultCyclePeriodSec;
-        float omegaRhythm = (Mathf.PI * 2.0f) / cyclePeriod;
+        // 2. 目標ロール角 70度 に向けたスロー＆ディープ周期の物理計算
+        float baseDeepDeg = Mathf.Clamp(IdealDeepTurnEdgeDeg, 60.0f, 72.0f);
+        float amplitudeErrorRatio = (_lastTurnPeakAbsX > 0.2f)
+            ? ((targetAmpRailX - _lastTurnPeakAbsX) / Mathf.Max(0.5f, targetAmpRailX))
+            : 0f;
 
-        // 2. 現在のエッジ角と角速度から「現在のターン位相」を推定し、自身の周期と位相同期(PLL)させる
-        float refPeakDeg = Mathf.Max(_controller.LastTurnPeakEdgeDeg, _controller.CurrentTurnPeakEdgeDeg);
-        if (refPeakDeg < 20.0f) refPeakDeg = 35.0f;
+        float desiredDeepDeg = Mathf.Clamp(baseDeepDeg + amplitudeErrorRatio * 6.0f, 65.0f, 72.0f);
+        _smoothedTargetDeg = Mathf.Lerp(_smoothedTargetDeg, desiredDeepDeg, 2.0f * dt);
 
-        // 「今より少し深いターン」の目標角度（最低35°〜最大68°の範囲で +LeadExtraDepthDeg）
-        float desiredPeakDeg = Mathf.Clamp(refPeakDeg + LeadExtraDepthDeg, 35.0f, 68.0f);
-        _smoothedTargetDeg = Mathf.Lerp(_smoothedTargetDeg, desiredPeakDeg, 3.0f * dt);
+        // ロール角70度での強大な遠心力（tan(70°) ≒ 2.75G）に基づくダイナミック周期
+        float deepPeakG = Mathf.Clamp(Mathf.Tan(_smoothedTargetDeg * Mathf.Deg2Rad) * 0.92f, 1.8f, 3.2f);
+        float omegaIdeal = Mathf.Sqrt((deepPeakG * cfg.g) / Mathf.Max(1.0f, targetAmpRailX)) / Mathf.Max(1.0f, SlowCarvePeriodScale);
+        float idealCyclePeriod = Mathf.Clamp((Mathf.PI * 2.0f) / omegaIdeal, 3.2f, 5.8f);
+        float omegaRhythm = (Mathf.PI * 2.0f) / idealCyclePeriod;
 
-        float normTheta = Mathf.Clamp((state.theta1 * Mathf.Rad2Deg) / Mathf.Max(15.0f, refPeakDeg), -1.2f, 1.2f);
-        float normOmega = Mathf.Clamp((state.omega1 * Mathf.Rad2Deg) / (refPeakDeg * omegaRhythm), -1.2f, 1.2f);
-
-        // 現在のスキーヤーの位相に対して、同じリズムで回しつつ緩やかに位相同期させる
         _pacemakerPhase += omegaRhythm * dt;
-        if (Mathf.Abs(state.theta1) > 5.0f * Mathf.Deg2Rad || Mathf.Abs(state.omega1) > 0.15f)
+
+        float normX = Mathf.Clamp(-state.x_c / Mathf.Max(0.5f, targetAmpRailX), -1.25f, 1.25f);
+        float normV = Mathf.Clamp(-state.v_c / Mathf.Max(0.5f, targetAmpRailX * omegaRhythm), -1.25f, 1.25f);
+        if (Mathf.Abs(state.x_c) > 0.20f || Mathf.Abs(state.v_c) > 0.25f)
         {
-            float skierPhase = Mathf.Atan2(normTheta, normOmega);
-            float phaseDiff = Mathf.DeltaAngle(_pacemakerPhase * Mathf.Rad2Deg, skierPhase * Mathf.Rad2Deg) * Mathf.Deg2Rad;
-            _pacemakerPhase += phaseDiff * Mathf.Clamp01(2.2f * dt);
+            float carriagePhase = Mathf.Atan2(normX, normV);
+            float phaseDiff = Mathf.DeltaAngle(_pacemakerPhase * Mathf.Rad2Deg, carriagePhase * Mathf.Rad2Deg) * Mathf.Deg2Rad;
+            _pacemakerPhase += phaseDiff * Mathf.Clamp01(1.2f * dt);
         }
 
-        // リード位相 = 現在の同期位相 + 先回りリード量 (LeadPhaseAdvanceRad)
         float leadPhase = _pacemakerPhase + LeadPhaseAdvanceRad;
 
-        // 3. 目標エッジ角から理想のマウスX・Y座標を算出
+        // 3. 70度ターンを実現するマウス座標の算出（最大振幅へフル活用）
         Vector3 centerWorld3 = cam.ScreenToWorldPoint(new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, -cam.transform.position.z));
         Vector2 centerWorld = new Vector2(centerWorld3.x, centerWorld3.y + _controller.MouseCenterOffsetY);
 
-        float maxRollDeg = Mathf.Min(72.0f, cfg.theta_bootOutDeg - 4.0f);
+        float maxRollDeg = Mathf.Min(72.0f, cfg.theta_bootOutDeg - 2.0f);
         float targetSteerNorm = Mathf.Clamp01(_smoothedTargetDeg / Mathf.Max(20.0f, maxRollDeg));
-        float fullRangeX = Mathf.Max(0.15f, cfg.mouseSteerFullRange);
+        float fullRangeX = Mathf.Max(2.80f, cfg.mouseSteerFullRange);
         float idealAmpX = _controller.MouseLineDeadzone + targetSteerNorm * fullRangeX;
 
-        // X座標: 左右のターン頂点へスムーズにリード
-        float leadSin = Mathf.Sin(leadPhase);
-        float idealX = centerWorld.x + idealAmpX * leadSin;
+        // X座標: 端でしっかりと70度のタメを作るワイドホールド波形
+        float rawSin = Mathf.Sin(leadPhase);
+        float holdSin = rawSin * (1.18f - 0.18f * rawSin * rawSin);
+        float idealX = centerWorld.x + idealAmpX * holdSin;
 
-        // 【修正】Y座標: 下の中立基準線(centerWorld.y)より少し上にマージンをとり、
-        // Lean-inライン(leanInSpan)との中間付近を中心として8の字を描く
-        float leanInSpan = Mathf.Max(0.20f, _controller.MouseLeanInLineOffsetY);
-        float bottomMargin = leanInSpan * 0.25f; // 下の基準線からの最低マージン（25%の高さ）
-        float midBaseY     = leanInSpan * 0.48f; // 軌道の中心高さ（中立基準線とLean-inラインのほぼ中間）
-        float verticalAmp  = leanInSpan * 0.18f; // 上下の振幅（最下点でも 0.48 - 0.18 = 30% の高さを維持し、最上点でも 66% に収める）
+        // Y座標: 70度の深い内倒・外傾を支えるワイド上下スパン
+        float leanInSpan   = Mathf.Max(2.00f, _controller.MouseLeanInLineOffsetY);
+        float bottomMargin = leanInSpan * 0.12f;
+        float midBaseY     = leanInSpan * 0.48f;
+        float verticalAmp  = leanInSpan * 0.38f;
 
-        // 切り替え時(X=0付近, cos(2θ)=+1)は中間より上(約66%高さ)で抜重・伸展を促し、
-        // ターンピーク(|X|=最大, cos(2θ)=-1)では中間より少し下(約30%高さ＝基準線より少し上のマージン位置)で外傾を維持
         float idealOffsetY = Mathf.Max(bottomMargin, midBaseY + verticalAmp * Mathf.Cos(leadPhase * 2.0f));
-
         Vector3 leadPos = new Vector3(idealX, centerWorld.y + idealOffsetY, 0f);
 
-        // 4. 理想の軌道（8の字リサージュガイド曲線）を薄く描画
-        const int orbitSegs = 48;
+        // 4. ガイド軌道およびパルスリングの描画
+        const int orbitSegs = 56;
         _idealLeadOrbitLine.positionCount = orbitSegs + 1;
         for (int i = 0; i <= orbitSegs; i++)
         {
             float th = (i / (float)orbitSegs) * Mathf.PI * 2.0f;
-            float ox = centerWorld.x + idealAmpX * Mathf.Sin(th);
+            float sTh = Mathf.Sin(th);
+            float hSin = sTh * (1.18f - 0.18f * sTh * sTh);
+            float ox = centerWorld.x + idealAmpX * hSin;
             float oy = centerWorld.y + Mathf.Max(bottomMargin, midBaseY + verticalAmp * Mathf.Cos(th * 2.0f));
             _idealLeadOrbitLine.SetPosition(i, new Vector3(ox, oy, 0f));
         }
 
-        // 5. 動く目印（パルスする二重リング）とマウスからの誘導ラインを描画
-        float pulse = 1.0f + 0.15f * Mathf.Sin(Time.time * 8.0f);
-        SetCirclePositions(_idealLeadOuterRing, leadPos, 0.068f * pulse, 24);
-        SetCirclePositions(_idealLeadInnerCore, leadPos, 0.022f, 16);
+        float slowPulse = 1.0f + 0.14f * Mathf.Sin(Time.time * 4.0f);
+        SetCirclePositions(_idealLeadOuterRing, leadPos, 0.076f * slowPulse, 24);
+        SetCirclePositions(_idealLeadInnerCore, leadPos, 0.025f, 16);
 
         if (input.has_mouse_world)
         {
             Vector3 mousePos = new Vector3(input.mouse_world.x, input.mouse_world.y, 0f);
             SetLine(_idealLeadTetherLine, mousePos, leadPos);
 
-            // マウスが目印に近いほどエメラルドグリーンに輝く
             float dist = Vector2.Distance(input.mouse_world, new Vector2(leadPos.x, leadPos.y));
-            float proximity = Mathf.Clamp01(1.0f - dist / 0.85f);
-            Color ringCol = Color.Lerp(new Color(0.20f, 0.90f, 1.00f, 0.85f), new Color(0.20f, 1.00f, 0.55f, 0.95f), proximity);
+            float proximity = Mathf.Clamp01(1.0f - dist / 0.95f);
+            Color ringCol = Color.Lerp(new Color(0.20f, 0.90f, 1.00f, 0.85f), new Color(0.10f, 1.00f, 0.45f, 0.95f), proximity);
             SetColor(_idealLeadOuterRing, ringCol);
         }
         else
@@ -229,9 +238,11 @@ public class SkyTechVisualizer : MonoBehaviour
         _centerReticleCircle = CreateLine("CenterReticle",     0.015f, new Color(0.75f, 0.88f, 1.00f, 0.40f), -2);
         _mouseGuideLine      = CreateLine("MouseGuideLine",    0.012f, new Color(1.00f, 0.90f, 0.40f, 0.30f), -1);
 
-        _railLine        = CreateLine("Rail",           0.035f, new Color(0.40f, 0.45f, 0.55f, 0.8f), 0);
-        _absorberLeft    = CreateLine("AbsorberL",      0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
-        _absorberRight   = CreateLine("AbsorberR",      0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
+        _railLine            = CreateLine("Rail",           0.035f, new Color(0.40f, 0.45f, 0.55f, 0.8f), 0);
+        _railTargetLeftTick  = CreateLine("RailTarget70L",  0.022f, new Color(0.20f, 0.95f, 0.85f, 0.65f), 1);
+        _railTargetRightTick = CreateLine("RailTarget70R",  0.022f, new Color(0.20f, 0.95f, 0.85f, 0.65f), 1);
+        _absorberLeft        = CreateLine("AbsorberL",      0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
+        _absorberRight       = CreateLine("AbsorberR",      0.030f, new Color(0.95f, 0.25f, 0.25f, 0.9f), 1);
         _ghostPeakLine   = CreateLine("GhostPeak",      0.020f, new Color(0.3f, 0.8f, 1.0f, 0.25f),   2);
         _carriageLine    = CreateLine("Carriage",       0.030f, new Color(0.75f, 0.80f, 0.90f, 0.9f), 3);
         _skiBoardLine    = CreateLine("SkiBoard",       0.045f, new Color(0.90f, 0.95f, 1.00f, 1.0f), 4);
@@ -287,6 +298,21 @@ public class SkyTechVisualizer : MonoBehaviour
         SetLine(_railLine, new Vector3(-halfRail, 0f, 0f), new Vector3(halfRail, 0f, 0f));
         SetBoxPositions(_absorberLeft, new Vector3(-halfRail - 0.05f, 0f, 0f), new Vector2(0.10f, 0.14f));
         SetBoxPositions(_absorberRight, new Vector3(halfRail + 0.05f, 0f, 0f), new Vector2(0.10f, 0.14f));
+
+        if (_railTargetLeftTick != null && _railTargetRightTick != null)
+        {
+            if (ShowIdealMouseLead)
+            {
+                float targetX = halfRail * TargetRailUsageRatio;
+                float tickHalfH = 0.08f;
+                SetLine(_railTargetLeftTick, new Vector3(-targetX, -tickHalfH, 0f), new Vector3(-targetX, tickHalfH, 0f));
+                SetLine(_railTargetRightTick, new Vector3(targetX, -tickHalfH, 0f), new Vector3(targetX, tickHalfH, 0f));
+            }
+            else
+            {
+                _railTargetLeftTick.positionCount = _railTargetRightTick.positionCount = 0;
+            }
+        }
     }
 
     private void UpdateCenterCrosshairGeometry(in SimInput input)

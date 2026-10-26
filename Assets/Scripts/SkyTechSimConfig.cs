@@ -84,8 +84,10 @@ namespace SkyTechSimulator
         public float gamma_roll = 125.0f;
         public float gamma_quad = 65.0f;
 
-        [Header("6b. Puppet Apex Control & Turn Transition")]
-        public float mouseSteerFullRange = 1.05f;
+          [Header("6b. Puppet Apex Control & Turn Transition")]
+        [Tooltip("マウス左右フルステアに必要なワールド横距離 [m] (大きいほどゆったり広く動かせる)")]
+        public float mouseSteerFullRange = 3.20f;
+
         [Range(10.0f, 40.0f)] public float apexTiltMaxDeg = 26.0f;
         [Range(8.0f, 25.0f)] public float angulationTransitionDeg = 14.0f;
         [Range(0.0f, 2.0f)] public float centerReturnPushGain = 0.95f;
@@ -99,17 +101,36 @@ namespace SkyTechSimulator
         public float extHeadDiveMaxDeg = 0.0f;
         public float headDiveRollDriveGain = 1.15f;
 
-        [Header("7. Snow Shear Failure")]
+        [Header("7. Snow Hardness, Edge Penetration & Grip Physics")]
+        [Tooltip("雪の硬さ [N/m^2 = Pa]: 軟雪 ~2.5e5, 標準圧雪 5.0e5 (1mm貫入 = 1Gグリップ), アイスバーン ~9.0e5")]
+        public float snowHardnessK = 500000.0f;
+        [Tooltip("有効エッジ長 (両脚合計の実効長) [m]")]
+        public float effectiveEdgeLength = 1.48f;
+        [Tooltip("エッジが雪面に噛み込み始める基準ビベル角 [deg]")]
+        public float edgeBiteRefDeg = 1.2f;
+        [Tooltip("ロール角増加に伴うくさび貫入ブースト倍率")]
+        public float edgeWedgeBoost = 2.20f;
+        [Tooltip("ロール角に対するくさび貫入指数 m")]
+        [Range(0.8f, 2.0f)] public float edgeWedgeExponent = 1.10f;
+        [Tooltip("最大有効エッジ貫入深さ (ブーツ・サイドウォール干渉上限) [m]")]
+        public float maxEdgePenetrationMeters = 0.018f;
+        [Tooltip("雪面垂直押付力における脚軸力 F_leg*cos(θ1) の寄与率")]
+        [Range(0.0f, 1.0f)] public float normalForceLegWeight = 0.80f;
+        [Tooltip("貫入深さに対する雪壁せん断強度倍率 (τ_snow / K_snow)")]
+        public float snowShearToHardnessRatio = 0.85f;
+        [Tooltip("エッジ接触面のクーロン摩擦係数")]
+        public float edgeCoulombGripCoeff = 0.28f;
+
         public float N_min_G = 0.22f;
         public float kappa_grip = 0.42f;
-        public float skidGripMultiplier = 0.55f;
+        public float skidGripMultiplier = 0.65f;
         public float skidMinAngleDeg = 30.0f;
         public float skidRefAngleDeg = 50.0f;
         [Range(0.5f, 2.5f)] public float snowAngleVulnerabilityExp = 1.35f;
         public float snowFailureVerticalForceG = 2.30f;
         public float snowFailurePowerThreshold = 1500.0f;
-        public float carriagePushbackGain = 0.30f;
-        public float skidRecoveryTau = 0.12f;
+        public float carriagePushbackGain = 0.22f;
+        public float skidRecoveryTau = 0.10f;
         public float z_H_min = 0.12f;
         public float theta_bootOutDeg = 90.0f;
 
@@ -137,6 +158,7 @@ namespace SkyTechSimulator
         public float alphaRad => alphaDeg * Mathf.Deg2Rad;
         public float theta_deadRad => theta_deadDeg * Mathf.Deg2Rad;
         public float carriageDeadzoneRad => carriageDeadzoneDeg * Mathf.Deg2Rad;
+        public float edgeBiteRefRad => edgeBiteRefDeg * Mathf.Deg2Rad;
         public float phi_out_maxRad => phi_out_maxDeg * Mathf.Deg2Rad;
         public float phi_in_maxRad => phi_in_maxDeg * Mathf.Deg2Rad;
         public float theta_bootOutRad => theta_bootOutDeg * Mathf.Deg2Rad;

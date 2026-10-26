@@ -73,10 +73,14 @@ public class SkyTechGameController : MonoBehaviour
 
     private void EnforceUpdatedRanges()
     {
-        if (MouseLeanInLineOffsetY < 2.0f) MouseLeanInLineOffsetY = 2.20f;
+        if (MouseLeanInLineOffsetY < 2.2f) MouseLeanInLineOffsetY = 2.40f;
         if (MouseLeanInUpRange < 1.5f)     MouseLeanInUpRange = 1.75f;
-        if (MouseExtendUpRange < 2.0f)     MouseExtendUpRange = 2.50f;
+        if (MouseExtendUpRange < 2.2f)     MouseExtendUpRange = 2.60f;
         if (MouseFullFlexDist < 2.0f)      MouseFullFlexDist = 2.50f;
+        if (Config != null && Config.mouseSteerFullRange < 2.50f)
+        {
+            Config.mouseSteerFullRange = 3.20f;
+        }
     }
 
     private void OnValidate() => EnforceUpdatedRanges();
@@ -191,35 +195,44 @@ public class SkyTechGameController : MonoBehaviour
         float baseCenterY = screenCenterWorld.y + MouseCenterOffsetY;
         float dy = mouseWorld.y - baseCenterY;
 
-        // 0. 上下基準線からのリーンアウト / 中間(鉛直〜ストレート) / リーンイン算出
+                // 0. 上下基準線からのリーンアウト / 中間(スイートスポット付き) / リーンイン算出
         if (hasMouseWorld && Config != null)
         {
-            float leanInOffset = Mathf.Max(0.02f, MouseLeanInLineOffsetY);
+            float leanInOffset = Mathf.Max(0.50f, MouseLeanInLineOffsetY);
 
             // 中立基準線より下 (dy < 0): 0 -> 1 (鉛直を超えてさらにリーンアウト)
-            _input.mouse_lean_out_norm = (dy < 0f) ? Mathf.Clamp01(-dy / Mathf.Max(0.05f, MouseFlexDownRange)) : 0f;
+            float rawOut = (dy < 0f) ? Mathf.Clamp01(-dy / Mathf.Max(0.20f, MouseFlexDownRange)) : 0f;
+            _input.mouse_lean_out_norm = rawOut * rawOut; // 境界付近での急変を防ぐ2乗カーブ
 
-            // 中立基準線 (dy = 0: 鉛直) ～ Lean-in line (dy = leanInOffset: ストレート内倒) の補間比率 (0..1)
-            _input.mouse_mid_norm = (dy > 0f) ? Mathf.Clamp01(dy / leanInOffset) : 0f;
+            // 中立基準線 (dy = 0) ～ Lean-in line (dy = leanInOffset) の補間比率 (0..1)
+            // 【改善】中間部分 (0.25 ～ 0.75) の感度を緩やかにするS字プラトー変換
+            // これにより、中間付近でマウスが上下にブレても姿勢がシビアに変動しない
+            float rawMid = (dy > 0f) ? Mathf.Clamp01(dy / leanInOffset) : 0f;
+            float centeredMid = (rawMid - 0.5f) * 2.0f; // -1.0 .. +1.0
+            // 中心(0)付近の傾きを30%に抑え、両端近くでのみ100%へ遷移する不感帯プラトー
+            float plateauMid = 0.5f + 0.5f * (0.30f * centeredMid + 0.70f * centeredMid * centeredMid * centeredMid);
+            _input.mouse_mid_norm = Mathf.Clamp01(plateauMid);
 
-            // Lean-in line より上 (dy > leanInOffset): 0 -> 1 (ストレート内倒を超えてさらに内倒)
-            _input.mouse_lean_in_norm = (dy > leanInOffset)
-                ? Mathf.Clamp01((dy - leanInOffset) / Mathf.Max(0.05f, MouseLeanInUpRange))
+            // Lean-in line より上 (dy > leanInOffset): 0 -> 1
+            float rawIn = (dy > leanInOffset)
+                ? Mathf.Clamp01((dy - leanInOffset) / Mathf.Max(0.20f, MouseLeanInUpRange))
                 : 0f;
+            _input.mouse_lean_in_norm = rawIn * rawIn;
 
             float absDx = Mathf.Abs(mouseWorld.x - screenCenterWorld.x);
             if (_hasPrevMouseSample)
             {
                 float inwardSpeed = Mathf.Max(0f, (_prevAbsDx - absDx) / safeDt);
                 float turnBankGate = Mathf.Clamp01((Mathf.Abs(_state.theta1) * Mathf.Rad2Deg - 8.0f) / 14.0f);
-                float returnTarget = Mathf.Clamp01((inwardSpeed / 1.6f) * Config.centerReturnPushGain) * turnBankGate;
-                float rate = (returnTarget > _centerReturnPushBoost) ? 12.0f : 3.2f;
+                float returnTarget = Mathf.Clamp01((inwardSpeed / 2.2f) * Config.centerReturnPushGain) * turnBankGate;
+                float rate = (returnTarget > _centerReturnPushBoost) ? 10.0f : 3.2f;
                 float target = (returnTarget > _centerReturnPushBoost) ? returnTarget : 0f;
                 _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, target, rate * safeDt);
             }
             _prevAbsDx = absDx;
             _hasPrevMouseSample = true;
         }
+
         else
         {
             _input.mouse_lean_out_norm = 0f;
@@ -272,7 +285,7 @@ public class SkyTechGameController : MonoBehaviour
             _input.u_flex_norm = 0f;
         }
 
-        // 2. 左右の頂点誘導入力
+                // 2. 左右の頂点誘導入力（広いストローク＆高ロール角での感度緩和）
         float steer = 0f;
         bool kbLeft = IsKeyHeld(KeyCode.A) || IsKeyHeld(KeyCode.LeftArrow);
         bool kbRight = IsKeyHeld(KeyCode.D) || IsKeyHeld(KeyCode.RightArrow);
@@ -287,9 +300,11 @@ public class SkyTechGameController : MonoBehaviour
             float absDx = Mathf.Abs(dx);
             if (absDx > MouseLineDeadzone)
             {
-                float fullRange = (Config != null) ? Mathf.Max(0.15f, Config.mouseSteerFullRange) : 1.05f;
+                float fullRange = (Config != null) ? Mathf.Max(2.50f, Config.mouseSteerFullRange) : 3.20f;
                 float normSteer = Mathf.Clamp01((absDx - MouseLineDeadzone) / fullRange);
-                steer = Mathf.Sign(dx) * Mathf.Lerp(normSteer, normSteer * normSteer, 0.25f);
+                // 中間〜深いロール角にかけて感度が穏やかになるよう、緩やかなS字（SmoothStepブレンド）を適用
+                float gentleSteer = Mathf.Lerp(normSteer, Mathf.SmoothStep(0f, 1f, normSteer), 0.45f);
+                steer = Mathf.Sign(dx) * gentleSteer;
             }
         }
 

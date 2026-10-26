@@ -38,6 +38,7 @@ namespace SkyTechSimulator
         public float V, stamina;
         public float y_CoM, z_CoM, Psi_CoM, R_CoM, z_H, F_leg, F_compress, u_ext_actual;
         public float I_eff, F_vert, G_z_up, F_lat_step, P_step_eff, snow_stress_ratio, skid_intensity;
+        public float F_snow_normal, edge_penetration_mm, F_grip_max, F_grip_actual; // 追加: エッジ貫入・グリップ物理量
         public float v_c_target, v_c_recoil_max, skid_pushback_force;
         public float s_rom, knee_flex_deg, knee_int_deg, posture_force_ratio, P_leg_ext, P_leg_peak_avail;
         public float G_base, lambda_sustain, a_c, kappa, kappa_target;
@@ -130,6 +131,10 @@ namespace SkyTechSimulator
                 F_compress = mg,
                 F_leg = mg,
                 F_vert = mg,
+                F_snow_normal = mg,
+                edge_penetration_mm = 0f,
+                F_grip_max = mg,
+                F_grip_actual = 0f,
                 lambda_sustain = 1.0f,
                 gripState = SkiGripState.Carving
             };
@@ -256,32 +261,35 @@ namespace SkyTechSimulator
             float headReach = 1.55f * cfg.l2;
 
             // -------------------------------------------------------------------------
-            // 【修正】中立基準線(midNorm=0) ～ Lean-inライン(midNorm=1) における姿勢マッピング
-            // 「合力(重力+遠心力)の釣り合いよりも外(外傾側)だが、鉛直よりは必ずターン内側」に収める
+            // 【改善】中立基準線(midNorm=0) ～ Lean-inライン(midNorm=1) における寛容な姿勢マッピング
+            // ロール角が大きくて速いターンのときほど、中間ゾーン全域を「理想の外傾バランス角」に安定させる
             // -------------------------------------------------------------------------
             
             // 1. 重力と横方向慣性力(遠心力)の釣り合い角 theta_force
             float theta_force = Mathf.Atan2(s.a_c, cfg.g);
-            
-            // 現在のターン方向(s.theta1)と同じ向きの釣り合い角成分を取り出す（逆向きや過大な値を防ぐ）
             float turnSign = SmoothSign(s.theta1, 1.5f * Mathf.Deg2Rad);
             float absForceAngle = SoftPlus(turnSign * theta_force);
             
-            // Lean-inライン(midNorm = 1)での目標体幹角:
-            // 基本はストレート(s.theta1)〜力の釣り合い角(theta_force)とし、板の傾きを超えない範囲に収める
-            float theta2_at_leanInLine = turnSign * SoftMin(absTheta1, SoftMax(absTheta1 * 0.85f, absForceAngle));
+            // Lean-inライン(midNorm = 1)での目標体幹角
+            float theta2_at_leanInLine = turnSign * SoftMin(absTheta1, SoftMax(absTheta1 * 0.82f, absForceAngle));
 
-            // 中立基準線(midNorm = 0)での目標体幹角:
-            // 完全な鉛直(0°)よりもわずかにターン内側(例えば板の傾きの10%内側)をキープさせることで、
-            // Lean-inラインから下がったときに「釣り合いよりは外だが、鉛直よりは内側（上の重心が下の重心より必ず内側）」を保証する
-            float theta2_at_centerLine = s.theta1 * 0.10f;
+            // 中立基準線(midNorm = 0)での目標体幹角（鉛直よりわずかにターン内側）
+            float theta2_at_centerLine = s.theta1 * 0.15f;
 
-            // midNorm (0..1) で [鉛直より内側] ～ [釣り合い角(ストレート)] の間を滑らかに補間
-            float theta2_mid_target = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, midNorm);
+            // 深いターン・速いターンで最も安定して踏める「理想のスイートスポット体幹角」（板の傾きの約50%＝しっかり外傾が効いた状態）
+            float theta2_sweet_spot = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, 0.48f);
+
+            // ロール角が大きい(35度以上) ＆ 横G・ターン速度が高いときほど 1.0 になる自動安定化係数
+            float highRollGate = AnalyticClamp01((absTheta1 - 22.0f * Mathf.Deg2Rad) / (25.0f * Mathf.Deg2Rad));
+            float fastTurnGate = AnalyticClamp01((Mathf.Abs(s.a_c) / cfg.g - 0.5f) / 1.0f);
+            float sweetSpotLock = 0.65f * highRollGate * Mathf.Max(0.4f, fastTurnGate);
+
+            // マウスの上下位置(midNorm)による体幹角と、スイートスポット体幹角をブレンド
+            // これにより、ロール角が大きく速いターン中は、マウスが中間ゾーン内で多少上下にズレても最適な外傾姿勢が崩れない
+            float raw_theta2_mid = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, midNorm);
+            float theta2_mid_target = Mathf.Lerp(raw_theta2_mid, theta2_sweet_spot, sweetSpotLock);
 
             // 股関節の相対角 phi = theta1 - theta2 に変換
-            // これにより midNorm = 0..1 の全域で 0 <= phi <= 0.9 * theta1 となり、
-            // 体幹が鉛直を超えてターン外側へ倒れることがなくなる
             float phi_mid_zone = s.theta1 - theta2_mid_target;
 
             // 2. 中立基準線より下 (leanOutNorm > 0) に入ったときのみ、鉛直を超えてさらに外傾(リーンアウト)させる
@@ -402,72 +410,108 @@ namespace SkyTechSimulator
             s.F_leg = SoftMax(F_vert_pos, F_vert_pos * cosAbsTheta1 + s.F_lat_step * sinAbsTheta1);
 
             // =========================================================================
-            // 3. 実雪面エッジ反力による直接並進ダイナミクス（浅い角度での素早い倒れ込みと45度以降のGを両立）
+            // 3. エッジ貫入深さ (Edge Penetration) と雪面グリップ力の物理計算
             // =========================================================================
             float effectiveRollRate = s.omega1 + 0.35f * (rollError / SoftMax(0.06f, tauShift));
             float sigma_phase = rollSignSmooth * SmoothSign(effectiveRollRate, 0.65f);
 
             float rollInDeficit = SoftPlus(SmoothSign(theta1_des, 2.0f * Mathf.Deg2Rad) * rollError);
-            // 【修正1】30度以下の浅い角度で目標角に向かって倒し込んでいる最中(rollIn)の検出感度を上げる
             float intentionalRollIn = leanOutGate * AnalyticClamp01(rollInDeficit / (10.0f * Mathf.Deg2Rad));
 
             float sigma_in = AnalyticClamp01(SoftPlus(sigma_phase)) * AnalyticStep(absTheta1, 15.0f * Mathf.Deg2Rad, 6.0f * Mathf.Deg2Rad);
             float sigma_out = AnalyticClamp01(SoftPlus(-sigma_phase));
 
+            // -------------------------------------------------------------------------
+            // A) ロール角・雪面垂直押付力・雪の硬さからのエッジ貫入深さ d_p [m] の算出
+            // -------------------------------------------------------------------------
+            // 1. 雪面を垂直に押す力 F_snow_normal:
+            //    脚軸力 F_leg の垂直成分は F_leg * cos|θ1| のため、ロール角が高くなるほど垂直押付力は減る
+            float legNormalComponent = SoftPlus(s.F_leg) * Mathf.Cos(absTheta1);
+            float wLeg = AnalyticClamp01(cfg.normalForceLegWeight);
+            s.F_snow_normal = SoftPlus((1.0f - wLeg) * F_vert_pos + wLeg * legNormalComponent);
+
+            // 2. ロール角による「エッジ噛み込み＆くさび貫入係数」 wedgeEfficiency:
+            //    ロール角が高くなるほど鋭いくさびとして垂直方向に刺さりやすくなる (3°で約1.0)
+            float biteRefRad = SoftMax(0.25f, cfg.edgeBiteRefDeg) * Mathf.Deg2Rad;
+            float edgeContactEngagement = absTheta1 / Mathf.Sqrt(absTheta1 * absTheta1 + biteRefRad * biteRefRad);
+            float sinWedge = Mathf.Pow(SoftMax(1e-4f, sinAbsTheta1), SoftMax(0.5f, cfg.edgeWedgeExponent));
+            float cosWedge = Mathf.Sqrt(cos1 * cos1 + 0.0625f);
+            float wedgeEfficiency = edgeContactEngagement * (1.0f + SoftMax(0.5f, cfg.edgeWedgeBoost) * (sinWedge / cosWedge));
+
+            // 3. エッジ貫入深さ d_p [m]:
+            //    標準圧雪 (K_snow = 500kPa, L_edge = 1.48m) にて 1G・ロール3° で d_p ≈ 1.0 mm (0.001m)
+            float K_snow_safe = SoftMax(50000.0f, cfg.snowHardnessK);
+            float L_edge_safe = SoftMax(0.50f, cfg.effectiveEdgeLength);
+            float rawPenetrationMeters = (s.F_snow_normal / (K_snow_safe * L_edge_safe)) * wedgeEfficiency;
+            float maxPenMeters = SoftMax(0.005f, cfg.maxEdgePenetrationMeters);
+            float d_p = maxPenMeters * (float)Math.Tanh(rawPenetrationMeters / maxPenMeters);
+            s.edge_penetration_mm = d_p * 1000.0f;
+
+            // 4. 最大グリップ力 F_grip_max [N]:
+            //    【純粋化】エッジの貫入深さ d_p と雪の硬さ K_snow だけで決定する (F_grip_max = L_edge * d_p * K_snow)
+            //    標準圧雪 (K_snow = 500kPa, L_edge = 1.48m) では d_p = 1.0mm のとき F_grip_max = 740N (約1.0G)
+            s.F_grip_max = L_edge_safe * d_p * K_snow_safe;
+            float safeGripMax = SoftMax(1.0f, s.F_grip_max);
+
+            // -------------------------------------------------------------------------
+            // B) 貫入したエッジの雪壁による横方向反力とグリップ上限判定
+            // -------------------------------------------------------------------------
             float vRefSafe = SoftMax(4.0f, cfg.V_ref);
             float rScSafe = SoftMax(3.0f, cfg.R_sc);
             float speedRatio = s.V / vRefSafe;
             float speedScale = 0.55f + 0.45f * AnalyticClamp(speedRatio, 0.50f, 1.65f);
 
             float G0_effective = 0.5f * (cfg.G0_curve + 2.20f * (vRefSafe * vRefSafe) / (cfg.g * rScSafe));
-            float edgeSignSmooth = SmoothSign(s.theta1, SoftMax(0.5f * Mathf.Deg2Rad, cfg.theta_deadRad));
+            float edgeSignSmooth = SmoothSign(s.theta1, SoftMax(0.3f * Mathf.Deg2Rad, cfg.theta_deadRad));
             float howeCurve = edgeSignSmooth * (Mathf.Pow(SoftMax(1e-4f, sinAbsTheta1), SoftMax(0.75f, cfg.sinPower_p)) / SoftMax(0.18f, Mathf.Cos(cfg.k_flex * absTheta1)));
 
             float angulationAlignment = SoftPlus(edgeSignSmooth * (s.phi / phiMax));
             float angulationBoost = 1.0f + cfg.k_ang_boost * angulationAlignment;
             float G_howe = G0_effective * angulationBoost * howeCurve * (speedRatio * speedRatio);
 
-            // 【修正2】30度までの浅いロール角では遠心力(横G)による起き上がりトルクを抑え、重力で素早く倒れ込めるようにする
-            // 一方で30度〜45度を超えたら100%のG_howeへ急速に立ち上げる
-            float shallowRollEntryGate = AnalyticStep(absTheta1, 24.0f * Mathf.Deg2Rad, 8.0f * Mathf.Deg2Rad);
-            float carveEngageEnvelope = AnalyticStep(absTheta1, 14.0f * Mathf.Deg2Rad, 6.0f * Mathf.Deg2Rad);
-            float eqScale = Mathf.Lerp(0.45f, 1.15f, carveEngageEnvelope) * (1.0f - 0.45f * intentionalRollIn * (1.0f - shallowRollEntryGate));
-            float G_com_equilibrium = Mathf.Lerp(G_eq, sin1 / cosAbsTheta1, 0.45f) * (eqScale + 0.18f * angulationAlignment + 0.30f * effLeanOut) * speedScale;
+            float penetrationBite = AnalyticClamp01(s.edge_penetration_mm / 0.65f);
+            float shallowRollEntryGate = AnalyticStep(absTheta1, 20.0f * Mathf.Deg2Rad, 7.0f * Mathf.Deg2Rad);
+            float eqScale = Mathf.Lerp(0.85f, 1.15f, penetrationBite) * (1.0f - 0.35f * intentionalRollIn * (1.0f - shallowRollEntryGate));
+            float G_com_equilibrium = Mathf.Lerp(G_eq, sin1 / cosAbsTheta1, 0.15f) * eqScale * speedScale;
 
-            // 25度以下ではhoweBlendを小さく保ち、28度〜42度で一気に1.0へ引き上げる
-            float howeBlend = AnalyticClamp01(0.08f + 0.92f * shallowRollEntryGate * (1.0f - 0.35f * intentionalRollIn) + 0.15f * angulationAlignment);
-            float biteRatio = AnalyticClamp01(absTheta1 / SoftMax(0.5f * Mathf.Deg2Rad, cfg.carriageDeadzoneRad));
-            float effectiveBite = Mathf.Lerp(biteRatio * biteRatio, biteRatio, carveEngageEnvelope);
-            float phaseGMod = (1.0f - 0.12f * sigma_in + 0.22f * sigma_out) * Mathf.Lerp(1.0f, 0.65f, intentionalRollIn * (1.0f - shallowRollEntryGate));
+            float howeBlend = AnalyticClamp01(0.25f * penetrationBite + 0.75f * shallowRollEntryGate * (1.0f - 0.30f * intentionalRollIn) + 0.15f * angulationAlignment);
+            float phaseGMod = (1.0f - 0.10f * sigma_in + 0.22f * sigma_out) * Mathf.Lerp(1.0f, 0.72f, intentionalRollIn * (1.0f - shallowRollEntryGate));
 
-            s.G_base = Mathf.Lerp(G_com_equilibrium, G_howe, howeBlend) * effectiveBite * phaseGMod;
+            s.G_base = Mathf.Lerp(G_com_equilibrium, G_howe, howeBlend) * penetrationBite * phaseGMod;
 
             float F_req_ideal = mg * Mathf.Cos(absPsi);
             float loadRatio = s.F_leg / SoftMax(0.35f * mg, cfg.loadSustainScale * F_req_ideal);
             float maxLambda = Mathf.Lerp(1.0f, SoftMax(1.2f, cfg.lambda_max), AnalyticClamp01((s.P_leg_ext + s.F_lat_step * v_y_ext) / 600.0f));
             s.lambda_sustain = AnalyticClamp(Mathf.Pow(AnalyticClamp(loadRatio, 0.85f, 1.8f), cfg.loadSustainPower_q), 0.92f, maxLambda);
 
-            // 雪面の挫屈（せん断破壊）を無効化し、どれだけ強く踏み込んでも100%エッジが噛み続けるように固定
-            s.snow_stress_ratio = 0.0f;
-            s.skid_intensity = 0.0f;
-            s.skid_pushback_force = 0.0f;
-
-            // キャリッジ固有質量を廃止（inertiaMassRatio = 1.0）し、雪面からの反力を直接身体質量 M に対する実加速度へ変換
             float viableGate = AnalyticStep(s.z_H, cfg.z_H_min, 2e-3f) * AnalyticStep(cfg.theta_bootOutRad, absTheta1, 2e-3f);
-            float carvingRetention = 1.0f;
-            float gripFactor = viableGate * weightGate;
-
             s.v_c_recoil_max = v_y_ext;
 
-            float F_carve = cfg.M * (s.G_base * cfg.g) * s.lambda_sustain * gripFactor;
+            float F_carve_demand = cfg.M * (s.G_base * cfg.g) * s.lambda_sustain * weightGate;
             float F_camber_rebound = weightGate * sigma_out * 0.22f * s.F_leg * sin1 * speedScale;
-            float activeExtDrive = weightGate * Mathf.Lerp(-1.0f, 1.0f, sigma_out) * s.u_ext_actual * sin1 * 0.35f;
+            float activeExtDrive = weightGate * Mathf.Lerp(-0.5f, 1.0f, sigma_out) * s.u_ext_actual * sin1 * 0.45f;
+            float F_total_lat_demand = F_carve_demand + F_camber_rebound + activeExtDrive;
 
-            // 【修正3】Capture-Point先行加速(a_capture_lead)が30度以下の倒れ込みにブレーキをかけないよう、浅い角度・ロールイン時は無効化する
+            float absDemand = Mathf.Abs(F_total_lat_demand);
+            s.snow_stress_ratio = absDemand / safeGripMax;
+
+            // 要求横力が F_grip_max (= L_edge * d_p * K_snow) を超えた分だけスキッドが発生
+            float targetSkid = AnalyticClamp01((s.snow_stress_ratio - 1.0f) / 0.50f);
+            float skidTau = (targetSkid > s.skid_intensity) ? 0.04f : SoftMax(0.05f, cfg.skidRecoveryTau);
+            s.skid_intensity = SolveFirstOrderExact(s.skid_intensity, targetSkid, skidTau, safeDt);
+
+            float carvingRetention = 1.0f - (1.0f - cfg.skidGripMultiplier) * s.skid_intensity;
+            // F_grip_max までは力を逃がさず受け止め、F_grip_max で上限飽和させる
+            float normDemand = absDemand / safeGripMax;
+            float linearHoldMag = absDemand / Mathf.Pow(1.0f + Mathf.Pow(normDemand, 4.0f), 0.25f);
+            s.F_grip_actual = viableGate * SmoothSign(F_total_lat_demand, 1.0f) * linearHoldMag * carvingRetention;
+
+            s.skid_pushback_force = -SmoothSign(s.theta1, 1e-2f) * s.skid_intensity * cfg.carriagePushbackGain * SoftPlus(absDemand - s.F_grip_max);
+
             float boundedFallingRate = 0.45f * (float)Math.Tanh((rollSignSmooth * SoftPlus(rollSignSmooth * s.omega1)) / 0.45f);
             float a_capture_lead = weightGate * cfg.capturePointLeadGain * shallowRollEntryGate * (1.0f - intentionalRollIn) * s.z_CoM * boundedFallingRate * carvingRetention;
 
-            float a_c_target = viableGate * ((F_carve + F_camber_rebound + activeExtDrive + s.skid_pushback_force) / cfg.M + a_capture_lead);
+            float a_c_target = viableGate * ((s.F_grip_actual + s.skid_pushback_force) / cfg.M + a_capture_lead);
             s.a_c = viableGate * SolveFirstOrderExact(s.a_c, a_c_target, AnalyticClamp(cfg.tau_G_lag, 0.010f, 0.025f), safeDt);
 
             // 原点復帰バネ(k_center=0)およびベルト・レール摺動減衰(C_rail=0)を廃止し、実加速度 s.a_c を直接積分 (ddx_c == s.a_c)
