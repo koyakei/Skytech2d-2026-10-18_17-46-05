@@ -279,14 +279,14 @@ namespace SkyTechSimulator
             float turnSign = SmoothSign(s.theta1, 1.5f * Mathf.Deg2Rad);
             float absForceAngle = SoftPlus(turnSign * theta_force);
             
-            float theta2_at_leanInLine = turnSign * SoftMin(absTheta1, SoftMax(absTheta1 * 0.82f, absForceAngle));
+            float theta2_at_leanInLine = s.theta1;
             float theta2_at_centerLine = s.theta1 * 0.15f;
             float theta2_sweet_spot = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, 0.48f);
 
             float highRollGate = AnalyticClamp01((absTheta1 - 22.0f * Mathf.Deg2Rad) / (25.0f * Mathf.Deg2Rad));
             float fastTurnGate = AnalyticClamp01((Mathf.Abs(s.a_c) / cfg.g - 0.5f) / 1.0f);
-            float sweetSpotLock = 0.65f * highRollGate * Mathf.Max(0.4f, fastTurnGate);
-
+            float manualStraightRelease = AnalyticClamp01((midNorm - 0.65f) / 0.35f);
+            float sweetSpotLock = 0.65f * highRollGate * fastTurnGate * (1.0f - manualStraightRelease) * (1.0f - leanInNorm);
             float raw_theta2_mid = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, midNorm);
             float theta2_mid_target = Mathf.Lerp(raw_theta2_mid, theta2_sweet_spot, sweetSpotLock);
 
