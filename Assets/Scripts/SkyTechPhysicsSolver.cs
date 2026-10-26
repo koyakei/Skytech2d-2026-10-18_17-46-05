@@ -38,7 +38,7 @@ namespace SkyTechSimulator
         public float V, stamina;
         public float y_CoM, z_CoM, Psi_CoM, R_CoM, z_H, F_leg, F_compress, u_ext_actual;
         public float I_eff, F_vert, G_z_up, F_lat_step, P_step_eff, snow_stress_ratio, skid_intensity;
-        public float F_snow_normal, edge_penetration_mm, F_grip_max, F_grip_actual; // 追加: エッジ貫入・グリップ物理量
+        public float F_snow_normal, edge_penetration_mm, F_grip_max, F_grip_actual;
         public float v_c_target, v_c_recoil_max, skid_pushback_force;
         public float s_rom, knee_flex_deg, knee_int_deg, posture_force_ratio, P_leg_ext, P_leg_peak_avail;
         public float G_base, lambda_sustain, a_c, kappa, kappa_target;
@@ -50,6 +50,10 @@ namespace SkyTechSimulator
         public const float FreePlayDeg = 2.0f;
         public const float SupportHoldDropMeters = 0.15f;
         public const float SupportFadeZoneMeters = 0.03f;
+
+        // リーンアウト時にストレート内倒へ移行する脚ロール角（80度）と移行幅（72度〜80度）
+        public const float MaxLeanOutLegRollDeg = 80.0f;
+        public const float StraightTransitionWidthDeg = 8.0f;
 
         private static float BoolGate(bool b) => Convert.ToSingle(b);
         private static float SmoothSign(float x, float eps = 1e-3f) => (float)Math.Tanh(x / SoftMax(1e-6f, eps));
@@ -222,7 +226,7 @@ namespace SkyTechSimulator
             float sinAbsTheta1 = Mathf.Sin(absTheta1);
 
             // =========================================================================
-            // 1. マウス高さ基準線による姿勢マッピング
+            // 1. マウス高さ基準線による姿勢マッピング ＆ 80度ストレート内倒移行制御
             // =========================================================================
             float gReset = BoolGate(input.w_reset);
             float activeGate = (1.0f - gReset) * (1.0f - BoolGate(input.steer_neutral_cmd));
@@ -237,10 +241,19 @@ namespace SkyTechSimulator
             float shiftActivity = AnalyticClamp01(SoftMax(Mathf.Abs(u_x), Mathf.Abs(s.u_shift_filtered)));
             float forceOverride = cfg.mouseForceOverrideRatio * shiftActivity;
 
-            float maxTargetRollRad = SoftMin(85.0f * Mathf.Deg2Rad, cfg.theta_bootOutRad - 4.0f * Mathf.Deg2Rad);
-            // 【修正1】中央(0)付近で急激に変化しないよう、べき乗(Pow 0.82)と狭いSmoothSignを廃止し、滑らかな線形＋緩やかな非線形にする
+            // --- 脚のロール角80度に向けたストレート内倒移行ブレンド係数の算出 ---
+            float maxLegRollLimitRad = SoftMin(MaxLeanOutLegRollDeg * Mathf.Deg2Rad, cfg.theta_bootOutRad - 2.0f * Mathf.Deg2Rad);
+            float transWidthRad = SoftMax(2.0f * Mathf.Deg2Rad, StraightTransitionWidthDeg * Mathf.Deg2Rad);
+            float transStartRad = maxLegRollLimitRad - transWidthRad;
+
+            // 現在の脚ロール角 |θ1| が 72°〜80° になるにつれて 0 -> 1 へ滑らかに遷移し、80度未満に起き上がると0へ戻る
+            float rawLimitRatio = AnalyticClamp01((absTheta1 - transStartRad) / transWidthRad);
+            float straightLockBlend = rawLimitRatio * rawLimitRatio * (3.0f - 2.0f * rawLimitRatio);
+
+            // マウス操作による目標脚ロール角の上限を80度にする（それ以上は外傾で脚を押し倒さない）
+            float maxTargetRollRad = maxLegRollLimitRad;
             float u_shift_abs = Mathf.Abs(s.u_shift_filtered);
-            float smoothFactor = u_shift_abs / Mathf.Sqrt(u_shift_abs * u_shift_abs + 0.015f); // 0付近で傾きが緩やかになる連続関数
+            float smoothFactor = u_shift_abs / Mathf.Sqrt(u_shift_abs * u_shift_abs + 0.015f);
             float mouseTargetTheta1 = s.u_shift_filtered * Mathf.Lerp(0.85f, 1.0f, smoothFactor) * maxTargetRollRad;
             
             float theta1_des = activeGate * AnalyticClamp(mouseTargetTheta1 + input.phi_lock_cmd, -maxTargetRollRad, maxTargetRollRad);
@@ -251,7 +264,8 @@ namespace SkyTechSimulator
             float oppositeInputGate = AnalyticClamp01(SoftPlus(-rollSignSmooth * shiftSignSmooth));
             float leanOutGate = 1.0f - oppositeInputGate;
 
-            float leanOutNorm = AnalyticClamp01(input.mouse_lean_out_norm);
+            // 80度に近づくにつれてリーンアウト入力を滑らかに絞り、ストレート内倒へ移行させる
+            float leanOutNorm = AnalyticClamp01(input.mouse_lean_out_norm) * (1.0f - straightLockBlend);
             float effLeanOut = leanOutNorm * leanOutGate;
             float midNorm = AnalyticClamp01(input.mouse_mid_norm);
             float leanInNorm = AnalyticClamp01(input.mouse_lean_in_norm);
@@ -260,46 +274,36 @@ namespace SkyTechSimulator
             float neutralL1 = AnalyticClamp(cfg.l_max - cfg.supportDropFromMaxMeters, cfg.l_min, cfg.l_max);
             float headReach = 1.55f * cfg.l2;
 
-            // -------------------------------------------------------------------------
-            // 【改善】中立基準線(midNorm=0) ～ Lean-inライン(midNorm=1) における寛容な姿勢マッピング
-            // ロール角が大きくて速いターンのときほど、中間ゾーン全域を「理想の外傾バランス角」に安定させる
-            // -------------------------------------------------------------------------
-            
             // 1. 重力と横方向慣性力(遠心力)の釣り合い角 theta_force
             float theta_force = Mathf.Atan2(s.a_c, cfg.g);
             float turnSign = SmoothSign(s.theta1, 1.5f * Mathf.Deg2Rad);
             float absForceAngle = SoftPlus(turnSign * theta_force);
             
-            // Lean-inライン(midNorm = 1)での目標体幹角
             float theta2_at_leanInLine = turnSign * SoftMin(absTheta1, SoftMax(absTheta1 * 0.82f, absForceAngle));
-
-            // 中立基準線(midNorm = 0)での目標体幹角（鉛直よりわずかにターン内側）
             float theta2_at_centerLine = s.theta1 * 0.15f;
-
-            // 深いターン・速いターンで最も安定して踏める「理想のスイートスポット体幹角」（板の傾きの約50%＝しっかり外傾が効いた状態）
             float theta2_sweet_spot = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, 0.48f);
 
-            // ロール角が大きい(35度以上) ＆ 横G・ターン速度が高いときほど 1.0 になる自動安定化係数
             float highRollGate = AnalyticClamp01((absTheta1 - 22.0f * Mathf.Deg2Rad) / (25.0f * Mathf.Deg2Rad));
             float fastTurnGate = AnalyticClamp01((Mathf.Abs(s.a_c) / cfg.g - 0.5f) / 1.0f);
             float sweetSpotLock = 0.65f * highRollGate * Mathf.Max(0.4f, fastTurnGate);
 
-            // マウスの上下位置(midNorm)による体幹角と、スイートスポット体幹角をブレンド
-            // これにより、ロール角が大きく速いターン中は、マウスが中間ゾーン内で多少上下にズレても最適な外傾姿勢が崩れない
             float raw_theta2_mid = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, midNorm);
             float theta2_mid_target = Mathf.Lerp(raw_theta2_mid, theta2_sweet_spot, sweetSpotLock);
 
-            // 股関節の相対角 phi = theta1 - theta2 に変換
             float phi_mid_zone = s.theta1 - theta2_mid_target;
-
-            // 2. 中立基準線より下 (leanOutNorm > 0) に入ったときのみ、鉛直を超えてさらに外傾(リーンアウト)させる
             float phi_extra_lean_out = leanOutNorm * (theta1_des * cfg.trunkLeanOutRatio + s.u_shift_filtered * (phiMax * 0.45f) * (1.0f - deepRollFactor * 0.4f));
-
-            // 3. Lean-inラインより上 (leanInNorm > 0) に入ったときのみ、釣り合い角を超えてさらに内倒(リーンイン)させる
             float phi_extra_lean_in = -leanInNorm * s.u_shift_filtered * phiInMax;
 
-            float phi_target = (1.0f - gReset) * AnalyticClamp(
+            // 通常の目標股関節角（80度未満での制御）
+            float phi_normal_target = AnalyticClamp(
                 phi_mid_zone + phi_extra_lean_out + phi_extra_lean_in - input.phi_lock_cmd,
+                -phiMax, phiMax
+            );
+
+            // 80度到達時は外傾成分のみを 0 (ストレート内倒) へ滑らかに収束させる（手動リーンイン操作は妨げない）
+            float phi_without_lean_in = AnalyticClamp(phi_mid_zone + phi_extra_lean_out - input.phi_lock_cmd, -phiMax, phiMax);
+            float phi_target = (1.0f - gReset) * AnalyticClamp(
+                phi_without_lean_in * (1.0f - straightLockBlend) + phi_extra_lean_in,
                 -phiMax, phiMax
             );
 
@@ -347,7 +351,7 @@ namespace SkyTechSimulator
             float baseKeyHold = Mathf.Lerp(Mathf.Lerp(neutralL1, cfg.l_max, AnalyticClamp01(input.u_ext_norm)), cfg.l_min, u_flex);
             float baseDesiredL1 = Mathf.Lerp(baseKeyHold, AnalyticClamp(input.l1_target, cfg.l_min, cfg.l_max), hasTargetGate);
 
-            float hammockEngage = (1.0f - midNorm) * leanOutGate * (1.0f - leanInNorm);
+            float hammockEngage = (1.0f - midNorm) * leanOutGate * (1.0f - leanInNorm) * (1.0f - straightLockBlend);
             float curHeadZ = s.l1 * cos1 + headReach * Mathf.Cos(s.theta1 - s.phi);
             float targetHeadZ = baseDesiredL1 + headReach * Mathf.Cos(s.theta2_ref);
             float headHeightDeficit = SoftPlus(targetHeadZ - curHeadZ) * hammockEngage * (1.0f - u_flex);
@@ -421,25 +425,16 @@ namespace SkyTechSimulator
             float sigma_in = AnalyticClamp01(SoftPlus(sigma_phase)) * AnalyticStep(absTheta1, 15.0f * Mathf.Deg2Rad, 6.0f * Mathf.Deg2Rad);
             float sigma_out = AnalyticClamp01(SoftPlus(-sigma_phase));
 
-            // -------------------------------------------------------------------------
-            // A) ロール角・雪面垂直押付力・雪の硬さからのエッジ貫入深さ d_p [m] の算出
-            // -------------------------------------------------------------------------
-            // 1. 雪面を垂直に押す力 F_snow_normal:
-            //    脚軸力 F_leg の垂直成分は F_leg * cos|θ1| のため、ロール角が高くなるほど垂直押付力は減る
             float legNormalComponent = SoftPlus(s.F_leg) * Mathf.Cos(absTheta1);
             float wLeg = AnalyticClamp01(cfg.normalForceLegWeight);
             s.F_snow_normal = SoftPlus((1.0f - wLeg) * F_vert_pos + wLeg * legNormalComponent);
 
-            // 2. ロール角による「エッジ噛み込み＆くさび貫入係数」 wedgeEfficiency:
-            //    ロール角が高くなるほど鋭いくさびとして垂直方向に刺さりやすくなる (3°で約1.0)
             float biteRefRad = SoftMax(0.25f, cfg.edgeBiteRefDeg) * Mathf.Deg2Rad;
             float edgeContactEngagement = absTheta1 / Mathf.Sqrt(absTheta1 * absTheta1 + biteRefRad * biteRefRad);
             float sinWedge = Mathf.Pow(SoftMax(1e-4f, sinAbsTheta1), SoftMax(0.5f, cfg.edgeWedgeExponent));
             float cosWedge = Mathf.Sqrt(cos1 * cos1 + 0.0625f);
             float wedgeEfficiency = edgeContactEngagement * (1.0f + SoftMax(0.5f, cfg.edgeWedgeBoost) * (sinWedge / cosWedge));
 
-            // 3. エッジ貫入深さ d_p [m]:
-            //    標準圧雪 (K_snow = 500kPa, L_edge = 1.48m) にて 1G・ロール3° で d_p ≈ 1.0 mm (0.001m)
             float K_snow_safe = SoftMax(50000.0f, cfg.snowHardnessK);
             float L_edge_safe = SoftMax(0.50f, cfg.effectiveEdgeLength);
             float rawPenetrationMeters = (s.F_snow_normal / (K_snow_safe * L_edge_safe)) * wedgeEfficiency;
@@ -447,15 +442,9 @@ namespace SkyTechSimulator
             float d_p = maxPenMeters * (float)Math.Tanh(rawPenetrationMeters / maxPenMeters);
             s.edge_penetration_mm = d_p * 1000.0f;
 
-            // 4. 最大グリップ力 F_grip_max [N]:
-            //    【純粋化】エッジの貫入深さ d_p と雪の硬さ K_snow だけで決定する (F_grip_max = L_edge * d_p * K_snow)
-            //    標準圧雪 (K_snow = 500kPa, L_edge = 1.48m) では d_p = 1.0mm のとき F_grip_max = 740N (約1.0G)
             s.F_grip_max = L_edge_safe * d_p * K_snow_safe;
             float safeGripMax = SoftMax(1.0f, s.F_grip_max);
 
-            // -------------------------------------------------------------------------
-            // B) 貫入したエッジの雪壁による横方向反力とグリップ上限判定
-            // -------------------------------------------------------------------------
             float vRefSafe = SoftMax(4.0f, cfg.V_ref);
             float rScSafe = SoftMax(3.0f, cfg.R_sc);
             float speedRatio = s.V / vRefSafe;
@@ -495,26 +484,20 @@ namespace SkyTechSimulator
             float absDemand = Mathf.Abs(F_total_lat_demand);
             s.snow_stress_ratio = absDemand / safeGripMax;
 
-            // 要求横力が F_grip_max (= L_edge * d_p * K_snow) を超えた分だけスキッドが発生
             float targetSkid = AnalyticClamp01((s.snow_stress_ratio - 1.0f) / 0.50f);
             float skidTau = (targetSkid > s.skid_intensity) ? 0.04f : SoftMax(0.05f, cfg.skidRecoveryTau);
             s.skid_intensity = SolveFirstOrderExact(s.skid_intensity, targetSkid, skidTau, safeDt);
 
             float carvingRetention = 1.0f - (1.0f - cfg.skidGripMultiplier) * s.skid_intensity;
-            // F_grip_max までは力を逃がさず受け止め、F_grip_max で上限飽和させる
             float normDemand = absDemand / safeGripMax;
             float linearHoldMag = absDemand / Mathf.Pow(1.0f + Mathf.Pow(normDemand, 4.0f), 0.25f);
             s.F_grip_actual = viableGate * SmoothSign(F_total_lat_demand, 1.0f) * linearHoldMag * carvingRetention;
 
             s.skid_pushback_force = -SmoothSign(s.theta1, 1e-2f) * s.skid_intensity * cfg.carriagePushbackGain * SoftPlus(absDemand - s.F_grip_max);
 
-            float boundedFallingRate = 0.45f * (float)Math.Tanh((rollSignSmooth * SoftPlus(rollSignSmooth * s.omega1)) / 0.45f);
-            float a_capture_lead = weightGate * 0 * shallowRollEntryGate * (1.0f - intentionalRollIn) * s.z_CoM * boundedFallingRate * carvingRetention;
-
-            float a_c_target = viableGate * ((s.F_grip_actual + s.skid_pushback_force) / cfg.M + a_capture_lead);
+            float a_c_target = viableGate * ((s.F_grip_actual + s.skid_pushback_force) / cfg.M);
             s.a_c = viableGate * SolveFirstOrderExact(s.a_c, a_c_target, AnalyticClamp(cfg.tau_G_lag, 0.010f, 0.025f), safeDt);
 
-            // 原点復帰バネ(k_center=0)およびベルト・レール摺動減衰(C_rail=0)を廃止し、実加速度 s.a_c を直接積分 (ddx_c == s.a_c)
             SolveSecondOrderExact(ref s.x_c, ref s.v_c, out float ddx_c, 0.0f, 0.0f, 0.0f, s.a_c, safeDt);
             s.v_c_target = s.v_c;
 
@@ -522,21 +505,17 @@ namespace SkyTechSimulator
             s.kappa = ddx_c / vSqSafe;
             s.kappa_target = a_c_target / vSqSafe;
 
-            // 仮想向心加速度と物理加速度の分離を廃止し、足元の物理加速度 ddx_c (= s.a_c) のみで回転運動方程式を駆動
             float a_pivot_total = ddx_c;
 
             // =========================================================================
             // 4. 2リンク回転運動方程式 ＆ 股関節サーボ
             // =========================================================================
-            // 【修正4】現実の足関節(内反・外反)および足裏荷重移動(COPシフト)による自然な初期重心オフセット
-            // 上の重心が外側に出ないよう姿勢を変えずに、足元の支点に対する実効重心レバーアームだけを最大約8〜12cmシフトさせる
-            float ankleCopShift = 0.11f * (theta1_des - s.theta1) * (1.0f - 0.5f * shallowRollEntryGate);
+            float ankleCopShift = 0.02f * (theta1_des - s.theta1) * (1.0f - 0.5f * shallowRollEntryGate);
             float effective_y_CoM = s.y_CoM + ankleCopShift;
 
             float tau_gravity = (1.0f - gReset) * mg * effective_y_CoM * (1.0f + 0.15f * sigma_in * Mathf.Sin(cfg.alphaRad));
             float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total;
 
-            // 【修正5】浅い角度で倒れ込む際のロール粘性ダンピング(totalRollDamping)を大幅に軽くし、現実の身体のような素早い落下角加速度を実現する
             float pendulumCritDamping = 2.0f * Mathf.Sqrt(s.I_eff * mg * SoftMax(0.30f, s.z_CoM));
             float coContractGain = AnalyticClamp(cfg.adaptiveDampingBoost, 0.5f, 5.0f);
             float rollReleaseFactor = (1.0f - 0.85f * intentionalRollIn) * (1.0f - 0.75f * oppositeInputGate) * Mathf.Lerp(0.35f, 1.0f, shallowRollEntryGate);
@@ -550,8 +529,8 @@ namespace SkyTechSimulator
             float tau_hip_load = m2_l2 * (cfg.g * Mathf.Sin(theta2_cur) - a_hip_inertial * Mathf.Cos(theta2_cur));
             float tau_hip_ff = (1.0f - gReset) * m2_l2 * (cfg.g * Mathf.Sin(theta2_target) - a_hip_inertial * Mathf.Cos(theta2_target));
 
-            float kp_hip_eff = SoftMax(950.0f, cfg.kp_hip) * (1.0f + 0.85f * shiftActivity + 0.65f * chi_up + 0.65f * hammockEngage);
-            float postureOmegaFollow = (1.0f - midNorm) * (1.0f - leanInNorm) + 0.35f * effLeanOut;
+            float kp_hip_eff = SoftMax(950.0f, cfg.kp_hip) * (1.0f + 0.85f * shiftActivity + 0.65f * chi_up + 0.65f * hammockEngage + 0.85f * straightLockBlend);
+            float postureOmegaFollow = ((1.0f - midNorm) * (1.0f - leanInNorm) + 0.35f * effLeanOut) * (1.0f - straightLockBlend);
             float dphi_target = (1.0f - gReset) * postureOmegaFollow * s.omega1;
             float dphi_error = s.dphi - dphi_target;
 
@@ -560,19 +539,26 @@ namespace SkyTechSimulator
 
             float I_couple = I2_hip + m2_l2 * s.l1 * cosPhi;
             float tau_hip_pd = kp_hip_eff * (phi_target - s.phi) - kd_hip_eff * dphi_error;
-            s.tau_hip_steer = tau_hip_ff + (1.0f - gReset) * AnalyticClamp(tau_hip_pd, -tau_hip_avail_neg * 1.5f, tau_hip_avail_pos * 1.5f);
+            float limitTorqueBoost = 1.0f + 0.65f * straightLockBlend;
+            s.tau_hip_steer = tau_hip_ff + (1.0f - gReset) * AnalyticClamp(tau_hip_pd, -tau_hip_avail_neg * 1.5f * limitTorqueBoost, tau_hip_avail_pos * 1.5f * limitTorqueBoost);
 
-            // -------------------------------------------------------------------------
-            // 【修正4】セクション4・A 内の dynMaxPhi / dynMinPhi 計算部分（置き換え）
-            // -------------------------------------------------------------------------
-            float lockAllowance = Mathf.Abs(input.phi_lock_cmd);
-            // 板の実角度(s.theta1)だけでなく目標角度(theta1_des)も許容幅に含めることで、
-            // 中立停止からのターン始動時に外傾がブロックされるのを防ぎ、かつ中央通過時のif分岐による不連続ジャンプを廃止する
+            float lockAllowance = Mathf.Abs(input.phi_lock_cmd) * (1.0f - straightLockBlend);
             float allowPos = SoftMax(0.0f, SoftMax(s.theta1, theta1_des)) + lockAllowance + 15.0f * Mathf.Deg2Rad;
             float allowNeg = SoftMin(0.0f, SoftMin(s.theta1, theta1_des)) - lockAllowance - 15.0f * Mathf.Deg2Rad;
             
-            float dynMaxPhi = Mathf.Lerp(SoftMin(phiMax, allowPos), phiMax, leanOutNorm + leanInNorm);
-            float dynMinPhi = Mathf.Lerp(SoftMax(-phiMax, allowNeg), -phiMax, leanOutNorm + leanInNorm);
+            float baseDynMaxPhi = Mathf.Lerp(SoftMin(phiMax, allowPos), phiMax, leanOutNorm + leanInNorm);
+            float baseDynMinPhi = Mathf.Lerp(SoftMax(-phiMax, allowNeg), -phiMax, leanOutNorm + leanInNorm);
+
+            // 80度に達するにつれて外傾側の可動上限を 0 (ストレート内倒) へ滑らかに絞り込むとともに、
+            // 急ロール時の勢いで phi = 0 を通り越してリーンイン(逆屈曲)しないよう反対側も 0 へガードする
+            float posTurnGate = AnalyticStep(s.theta1, 0.0f, 2.0f * Mathf.Deg2Rad);
+            float negTurnGate = 1.0f - posTurnGate;
+            float dynMaxPhi = baseDynMaxPhi * (1.0f - straightLockBlend * posTurnGate);
+            float dynMinPhi = baseDynMinPhi * (1.0f - straightLockBlend * negTurnGate);
+
+            float allowLeanInAtLimit = leanInNorm;
+            dynMinPhi = Mathf.Lerp(dynMinPhi, SoftMax(dynMinPhi, -allowLeanInAtLimit * phiInMax), straightLockBlend * posTurnGate);
+            dynMaxPhi = Mathf.Lerp(dynMaxPhi, SoftMin(dynMaxPhi,  allowLeanInAtLimit * phiInMax), straightLockBlend * negTurnGate);
 
             float tau_hip_coriolis = -m2_l2 * (2.0f * s.dl1 * s.omega1 * cosPhi + s.l1 * s.omega1 * s.omega1 * sinPhi);
             SolveSecondOrderBoundedExact(
@@ -582,20 +568,24 @@ namespace SkyTechSimulator
             );
 
             // B. 下部リンク角 theta1(t)
-            // 【修正6】hammockEngageによる反作用カットを廃止し、股関節角加速度のクランプを広げて反作用トルクをしっかり下部リンクへ伝える
-            float reactionScale = Mathf.Lerp(AnalyticClamp(cfg.hipReactionGain, 0.65f, 1.0f), 1.0f, shiftActivity);
+            // 外傾(phi)をストレート(0)へ戻す際の急激な角加速度 ddphi が、反作用で脚を引き起こしてしまうのを防ぐ
+            float recoveringDdphiGate = AnalyticStep(-turnSign * ddphi, 0.0f, 2.0f);
+            float straightReactionDamp = 1.0f - straightLockBlend * recoveringDdphiGate * 0.90f;
+            float reactionScale = Mathf.Lerp(AnalyticClamp(cfg.hipReactionGain, 0.65f, 1.0f), 1.0f, shiftActivity) * straightReactionDamp;
+
             float tau_hip_inertial_reaction = (1.0f - gReset) * reactionScale * (I_couple * AnalyticClamp(ddphi, -60.0f, 60.0f) + m2_l2 * s.l1 * sinPhi * s.dphi * s.dphi);
             float dI_eff_dt = 2.0f * half_dI_dl1 * s.dl1 + dI_dphi * s.dphi;
 
+            // 物理境界は -halfPi, halfPi (±90度) とし、バランス崩壊時は80度を超えて自然に転倒(BootOut / HipCrash)させる
             SolveSecondOrderBoundedExact(
                 ref s.theta1, ref s.omega1, out _,
                 0.0f, (gReset * 850.0f) / s.I_eff, (weightGate * totalRollDamping + SoftMax(0.0f, dI_eff_dt) + gReset * 160.0f) / (2.0f * s.I_eff),
-                (tau_gravity + tau_inertial_com + tau_hip_inertial_reaction) / s.I_eff, -halfPi, halfPi, safeDt
+                (tau_gravity + tau_inertial_com + tau_hip_inertial_reaction) / s.I_eff,
+                -halfPi, halfPi, safeDt
             );
 
             if (gReset < 0.5f)
             {
-                // 【修正5】事後クランプもif分岐を廃止して滑らかに制限
                 s.phi = AnalyticClamp(s.phi, dynMinPhi, dynMaxPhi);
             }
 
