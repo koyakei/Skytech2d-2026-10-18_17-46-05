@@ -217,7 +217,7 @@ namespace SkyTechSimulator
             float phiInMax = SoftMax(0.20f, Mathf.Abs(cfg.phi_in_maxRad));
             float tauHipMax = SoftMax(100.0f, cfg.hipSteerMaxIsoTorque);
             float sin1 = Mathf.Sin(s.theta1), cos1 = Mathf.Cos(s.theta1);
-            float absTheta1 = SoftMin(Mathf.Abs(s.theta1), 82f * Mathf.Deg2Rad);
+            float absTheta1 = SoftMin(Mathf.Abs(s.theta1), 90f * Mathf.Deg2Rad);
             float cosAbsTheta1 = SoftMax(0.15f, Mathf.Cos(absTheta1));
             float sinAbsTheta1 = Mathf.Sin(absTheta1);
 
@@ -237,7 +237,7 @@ namespace SkyTechSimulator
             float shiftActivity = AnalyticClamp01(SoftMax(Mathf.Abs(u_x), Mathf.Abs(s.u_shift_filtered)));
             float forceOverride = cfg.mouseForceOverrideRatio * shiftActivity;
 
-            float maxTargetRollRad = SoftMin(72.0f * Mathf.Deg2Rad, cfg.theta_bootOutRad - 4.0f * Mathf.Deg2Rad);
+            float maxTargetRollRad = SoftMin(85.0f * Mathf.Deg2Rad, cfg.theta_bootOutRad - 4.0f * Mathf.Deg2Rad);
             // 【修正1】中央(0)付近で急激に変化しないよう、べき乗(Pow 0.82)と狭いSmoothSignを廃止し、滑らかな線形＋緩やかな非線形にする
             float u_shift_abs = Mathf.Abs(s.u_shift_filtered);
             float smoothFactor = u_shift_abs / Mathf.Sqrt(u_shift_abs * u_shift_abs + 0.015f); // 0付近で傾きが緩やかになる連続関数
@@ -326,7 +326,7 @@ namespace SkyTechSimulator
             float maxAngShiftRadNeg = SoftMin(phiMax, Mathf.Asin(AnalyticClamp(tau_hip_avail_neg * invM2L2G, 0.0f, 0.999f)));
 
             float L_eff = SoftMax(0.22f, L1 + 0.35f * L2);
-            float halfPi = 85.0f * Mathf.Deg2Rad;
+            float halfPi = 90.0f * Mathf.Deg2Rad;
             s.dy_min_torque = L_eff * (Mathf.Sin(SoftMax(-halfPi, s.theta1 - maxAngShiftRadNeg)) - sin1);
             s.dy_max_torque = L_eff * (Mathf.Sin(SoftMin(halfPi, s.theta1 + maxAngShiftRadPos)) - sin1);
 
@@ -509,7 +509,7 @@ namespace SkyTechSimulator
             s.skid_pushback_force = -SmoothSign(s.theta1, 1e-2f) * s.skid_intensity * cfg.carriagePushbackGain * SoftPlus(absDemand - s.F_grip_max);
 
             float boundedFallingRate = 0.45f * (float)Math.Tanh((rollSignSmooth * SoftPlus(rollSignSmooth * s.omega1)) / 0.45f);
-            float a_capture_lead = weightGate * cfg.capturePointLeadGain * shallowRollEntryGate * (1.0f - intentionalRollIn) * s.z_CoM * boundedFallingRate * carvingRetention;
+            float a_capture_lead = weightGate * 0 * shallowRollEntryGate * (1.0f - intentionalRollIn) * s.z_CoM * boundedFallingRate * carvingRetention;
 
             float a_c_target = viableGate * ((s.F_grip_actual + s.skid_pushback_force) / cfg.M + a_capture_lead);
             s.a_c = viableGate * SolveFirstOrderExact(s.a_c, a_c_target, AnalyticClamp(cfg.tau_G_lag, 0.010f, 0.025f), safeDt);
@@ -534,8 +534,7 @@ namespace SkyTechSimulator
             float effective_y_CoM = s.y_CoM + ankleCopShift;
 
             float tau_gravity = (1.0f - gReset) * mg * effective_y_CoM * (1.0f + 0.15f * sigma_in * Mathf.Sin(cfg.alphaRad));
-            float z_CoM_cuff = Mathf.Lerp(s.z_CoM, s.R_CoM, AnalyticClamp01(cfg.beta_cuff) * sinAbsTheta1 * sinAbsTheta1);
-            float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total * z_CoM_cuff;
+            float tau_inertial_com = -(1.0f - gReset) * cfg.M * a_pivot_total;
 
             // 【修正5】浅い角度で倒れ込む際のロール粘性ダンピング(totalRollDamping)を大幅に軽くし、現実の身体のような素早い落下角加速度を実現する
             float pendulumCritDamping = 2.0f * Mathf.Sqrt(s.I_eff * mg * SoftMax(0.30f, s.z_CoM));

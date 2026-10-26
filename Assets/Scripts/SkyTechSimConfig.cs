@@ -18,7 +18,7 @@ namespace SkyTechSimulator
         [Header("2. Modified Howe Flex Curve")]
         public float G0_curve = 2.60f;
         public float k_flex = 0.14f;
-        public float sinPower_p = 0.82f;
+        public float sinPower_p = 1.0f;
         public float V_ref = 14.5f;
 
         [Header("3. Unstable Saddle & Active Load Maintenance")]
@@ -90,7 +90,7 @@ namespace SkyTechSimulator
 
         [Range(10.0f, 40.0f)] public float apexTiltMaxDeg = 26.0f;
         [Range(8.0f, 25.0f)] public float angulationTransitionDeg = 14.0f;
-        [Range(0.0f, 2.0f)] public float centerReturnPushGain = 0.95f;
+        [Range(0.0f, 2.0f)] public float centerReturnPushGain = 0f;
         [Range(0.1f, 1.5f)] public float transitionReboundGain = 0.60f;
         [Range(0.0f, 1.0f)] public float mouseForceOverrideRatio = 0.85f;
         public float mouseRollMomentGain = 1.80f;
@@ -131,7 +131,7 @@ namespace SkyTechSimulator
         public float snowFailurePowerThreshold = 1500.0f;
         public float carriagePushbackGain = 0.22f;
         public float skidRecoveryTau = 0.10f;
-        public float z_H_min = 0.12f;
+        public float z_H_min = 0.0f;
         public float theta_bootOutDeg = 90.0f;
 
         [Header("8. Extension Righting & Tuck Centering Return")]
