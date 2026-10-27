@@ -26,6 +26,16 @@ public class SkyTechGameController : MonoBehaviour
     public MouseHeightControlMode HeightControlMode = MouseHeightControlMode.VerticalSignedFromCenter;
     public float MouseCenterOffsetY = 0.45f;
 
+    [Header("=== AirPods モーション連携設定 ===")]
+    [Tooltip("AirPodsの傾きモーション（頭のロール角）で角付け角(_lockedHipDeg)を操作する")]
+    public bool UseAirPodsMotion = true;
+    [Tooltip("AirPodsのロール角感度倍率")]
+    [Range(0.5f, 3.0f)] public float AirPodsRollSensitivity = 1.2f;
+    [Tooltip("AirPodsロール角の不感帯（度）")]
+    [Range(0.0f, 5.0f)] public float AirPodsRollDeadzone = 1.0f;
+    [Tooltip("AirPodsのピッチ角（うなずき）で脚の伸縮を補助する")]
+    public bool UseAirPodsPitchForLeg = false;
+
     public float MouseLeanInLineOffsetY = 2.20f;
     public float MouseLeanInUpRange = 1.75f;
     public float MouseExtendUpRange = 2.50f;
@@ -91,6 +101,16 @@ public class SkyTechGameController : MonoBehaviour
         if (Config == null) Config = ScriptableObject.CreateInstance<SkyTechSimConfig>();
     }
 
+    private void OnEnable()
+    {
+        AirPodsMotionManager.Start();
+    }
+
+    private void OnDisable()
+    {
+        AirPodsMotionManager.Stop();
+    }
+
     private void Start() => ResetSimulation();
 
     private void Update() => HandleKeyboardInput();
@@ -145,12 +165,39 @@ public class SkyTechGameController : MonoBehaviour
             return;
         }
 
+        if (IsKeyDown(KeyCode.C))
+        {
+            AirPodsMotionManager.Calibrate();
+        }
+
         bool qDown = IsKeyDown(KeyCode.Q), qHeld = IsKeyHeld(KeyCode.Q);
         bool eDown = IsKeyDown(KeyCode.E), eHeld = IsKeyHeld(KeyCode.E);
         bool resetActive = IsKeyDown(KeyCode.W) || IsKeyHeld(KeyCode.W)
                         || IsKeyDown(KeyCode.X) || IsKeyHeld(KeyCode.X)
-                        || IsKeyDown(KeyCode.C) || IsKeyHeld(KeyCode.C)
                         || (qHeld && eHeld);
+
+#if UNITY_EDITOR
+        float mouseScrollY = 0f;
+        try { mouseScrollY = Input.mouseScrollDelta.y; } catch { }
+        AirPodsMotionManager.UpdateEditorSimulation(Time.deltaTime, qHeld, eHeld, mouseScrollY);
+#endif
+
+        float airPodsRoll = 0f;
+        float airPodsPitch = 0f;
+        bool hasAirPodsMotion = UseAirPodsMotion && AirPodsMotionManager.IsActive;
+
+        if (hasAirPodsMotion)
+        {
+            float rawRoll = AirPodsMotionManager.UpdateAndGetSmoothedRollDeg(Time.deltaTime, 0.06f);
+            airPodsPitch = AirPodsMotionManager.UpdateAndGetSmoothedPitchDeg(Time.deltaTime, 0.08f);
+
+            float absRoll = Mathf.Abs(rawRoll);
+            if (absRoll > AirPodsRollDeadzone)
+            {
+                float effectiveRoll = Mathf.Sign(rawRoll) * (absRoll - AirPodsRollDeadzone) * AirPodsRollSensitivity;
+                airPodsRoll = Mathf.Clamp(effectiveRoll, -75.0f, 75.0f);
+            }
+        }
 
         if (resetActive)
         {
@@ -168,14 +215,27 @@ public class SkyTechGameController : MonoBehaviour
         else
         {
             _input.w_reset = false;
-            UpdateRollRepeat(qDown, qHeld, -1f, ref _leftRollHoldTimer, ref _leftRollRepeatTimer);
-            UpdateRollRepeat(eDown, eHeld,  1f, ref _rightRollHoldTimer, ref _rightRollRepeatTimer);
+            if (hasAirPodsMotion && (Mathf.Abs(airPodsRoll) > 0.01f || (!qHeld && !eHeld && !qDown && !eDown)))
+            {
+                _lockedHipDeg = Mathf.Lerp(_lockedHipDeg, airPodsRoll, 16.0f * Time.deltaTime);
+            }
+            else
+            {
+                UpdateRollRepeat(qDown, qHeld, -1f, ref _leftRollHoldTimer, ref _leftRollRepeatTimer);
+                UpdateRollRepeat(eDown, eHeld,  1f, ref _rightRollHoldTimer, ref _rightRollRepeatTimer);
+            }
         }
 
         _input.phi_lock_cmd = _lockedHipDeg * Mathf.Deg2Rad;
 
         bool extPressed = IsKeyHeld(KeyCode.Space) || IsKeyHeld(KeyCode.UpArrow);
         bool flexPressed = IsKeyHeld(KeyCode.S);
+
+        if (hasAirPodsMotion && UseAirPodsPitchForLeg)
+        {
+            if (airPodsPitch > 6.0f) extPressed = true;
+            else if (airPodsPitch < -6.0f) flexPressed = true;
+        }
 
 #if ENABLE_INPUT_SYSTEM
         if (Gamepad.current != null)

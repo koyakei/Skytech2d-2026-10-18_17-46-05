@@ -399,6 +399,14 @@ public class SkyTechVisualizer : MonoBehaviour
 
         SetLine(_trunkLine, H, U);
         SetCirclePositions(_headCircle, HeadPos, 0.075f, 20);
+        if (AirPodsMotionManager.IsActive)
+        {
+            SetColor(_headCircle, new Color(0.35f, 0.95f, 0.85f, 1.0f));
+        }
+        else
+        {
+            SetColor(_headCircle, new Color(1.0f, 0.85f, 0.7f, 1.0f));
+        }
 
         UpdatePuppetApexGuide(H, HeadPos, state, input, cfg);
 
@@ -537,7 +545,7 @@ public class SkyTechVisualizer : MonoBehaviour
 
     private void DrawBiomechanicsPanel(in SimState state, SkyTechSimConfig cfg)
     {
-        Rect panelRect = new Rect(15, 15, 355, 480);
+        Rect panelRect = new Rect(15, 15, 355, 540);
         GUI.Box(panelRect, GUIContent.none, _panelStyle);
 
         float curY = panelRect.y + 10, leftX = panelRect.x + 12, contentW = panelRect.width - 24;
@@ -605,7 +613,24 @@ public class SkyTechVisualizer : MonoBehaviour
         float staminaNorm = (cfg.maxStamina > 0.001f) ? Mathf.Clamp01(state.stamina / cfg.maxStamina) : 1f;
         DrawMetricRow(leftX, ref curY, contentW, "Anaerobic Stamina", $"{state.stamina:F0} J ({staminaNorm * 100f:F0}%)");
         DrawProgressBar(new Rect(leftX, curY, contentW, 10), staminaNorm, staminaNorm > 0.35f ? new Color(0.3f, 0.9f, 0.4f) : new Color(0.95f, 0.3f, 0.2f));
-        curY += 16;
+        curY += 14;
+
+        bool airPodsActive = AirPodsMotionManager.IsActive;
+        string apStatus;
+#if UNITY_EDITOR
+        apStatus = airPodsActive ? "<color=#F4D03F>EDITOR SIM</color>" : "<color=#7F8C8D>OFFLINE</color>";
+#else
+        apStatus = airPodsActive ? "<color=#58D68D>CONNECTED</color>" : "<color=#7F8C8D>OFFLINE</color>";
+#endif
+        DrawMetricRow(leftX, ref curY, contentW, "AirPods Motion", apStatus);
+        if (airPodsActive)
+        {
+            float apRoll = AirPodsMotionManager.GetRollDeg();
+            float apPitch = AirPodsMotionManager.GetPitchDeg();
+            DrawMetricRow(leftX, ref curY, contentW, "  Head Roll (左右傾き)", $"{apRoll:+0.0;-0.0;0.0}° [C:初期化]");
+            DrawMetricRow(leftX, ref curY, contentW, "  Head Pitch (うなずき)", $"{apPitch:+0.0;-0.0;0.0}°");
+        }
+        curY += 4;
 
         string assistStr = _controller.AutoAngulationAssist ? "<color=#2ECC71>AUTO-ASSIST: ON</color>" : "<color=#BDC3C7>MANUAL (Tab)</color>";
         GUI.Label(new Rect(leftX, curY, contentW, 18), $"Control: {assistStr}", _labelStyle);
@@ -649,7 +674,7 @@ public class SkyTechVisualizer : MonoBehaviour
             "<color=#FF73BF>[リーンイン線より上]</color> 手動リーンイン   |   <color=#FFA040>[中立線より下]</color> リーンアウト(脚屈曲なし)   |   <color=#58D68D>[Space / ↑ / 中立線より上]</color> 脚伸展   |   <color=#85C1E9>[S]</color> 脚屈曲",
             _guideStyle);
         GUI.Label(new Rect(panelRect.x, panelRect.y + 24, panelW, 18),
-            $"<color=#5DADE2>[マウス左右 / A・D]</color> 頭頂誘導   |   <color=#F4D03F>[Q / E]</color> 股関節固定({_controller.TargetLegRollDeg:+0;-0;0}°)   |   <color=#2ECC71>[W]</color> 直立リセット   |   <color=#E74C3C>[R]</color> リセット",
+            $"<color=#5DADE2>[マウス左右 / A・D]</color> 頭頂誘導   |   <color=#F4D03F>[Q / E or AirPods傾き]</color> 股関節角({_controller.TargetLegRollDeg:+0;-0;0}°)   |   <color=#58D68D>[C]</color> ゼロ点補正   |   <color=#2ECC71>[W]</color> 直立   |   <color=#E74C3C>[R]</color> リセット",
             _guideStyle);
     }
 
