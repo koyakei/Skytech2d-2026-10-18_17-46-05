@@ -27,6 +27,12 @@ public class SkyTechVisualizer : MonoBehaviour
     [Tooltip("iPhone傾きに対するカメラ逆回転の追従比率（0.70〜1.00推奨）")]
     [Range(0.0f, 1.0f)] public float CameraHorizonLockRatio = 0.75f;
 
+    [Header("=== レール画面表示・カメラフィッティング設定 ===")]
+    [Tooltip("画面端とレールの間の安全余白（メートル: 0.15〜0.30推奨。横幅いっぱいにフィットさせます）")]
+    [Range(0.05f, 0.60f)] public float RailSideMargin = 0.20f;
+    [Tooltip("レール(y=0)の画面下端からの垂直マージン比率（画面高さに対する比率: 0.15〜0.25推奨）")]
+    [Range(0.10f, 0.35f)] public float RailBottomMarginRatio = 0.18f;
+
     private Camera _mainCamera;
 
     private float _pacemakerPhase = 0f;
@@ -94,12 +100,9 @@ public class SkyTechVisualizer : MonoBehaviour
         }
 
         _mainCamera.orthographic = true;
-        float halfRail = (_controller != null && _controller.Config != null) ? _controller.Config.W_rail * 0.5f : 3.60f;
-        float aspect = (_mainCamera.pixelWidth > 0 && _mainCamera.pixelHeight > 0) ? (float)_mainCamera.pixelWidth / _mainCamera.pixelHeight : (16f / 9f);
-        _mainCamera.orthographicSize = Mathf.Max(2.6f, (halfRail + 0.35f) / Mathf.Max(0.5f, aspect));
-        _mainCamera.transform.SetPositionAndRotation(new Vector3(0f, 0.85f, -10f), Quaternion.identity);
         _mainCamera.backgroundColor = new Color(0.063f, 0.082f, 0.125f);
         _mainCamera.clearFlags = CameraClearFlags.SolidColor;
+        UpdateCameraFraming();
     }
 
     private void UpdateCamera()
@@ -107,10 +110,37 @@ public class SkyTechVisualizer : MonoBehaviour
         if (_mainCamera == null) EnsureCameraSetup();
         if (_mainCamera == null) return;
 
+        UpdateCameraFraming();
+
         // iPhoneの傾き角の70%〜100%分だけカメラを逆回転させ、ゲーム内の重力鉛直を実空間の鉛直と一致させる
         float ratio = EnableCameraHorizonLock ? CameraHorizonLockRatio : 0f;
         float camCounterRoll = (_controller != null && _controller.UseIosSensorControl) ? -_controller.CurrentDeviceRollDeg * ratio : 0f;
         _mainCamera.transform.rotation = Quaternion.Euler(0f, 0f, camCounterRoll);
+    }
+
+    private void UpdateCameraFraming()
+    {
+        if (_mainCamera == null) return;
+        _mainCamera.orthographic = true;
+
+        float halfRail = (_controller != null && _controller.Config != null) ? _controller.Config.W_rail * 0.5f : 3.60f;
+        float aspect = (_mainCamera.pixelWidth > 0 && _mainCamera.pixelHeight > 0)
+            ? (float)_mainCamera.pixelWidth / _mainCamera.pixelHeight
+            : ((Screen.width > 0 && Screen.height > 0) ? (float)Screen.width / Screen.height : (16f / 9f));
+
+        // iPhoneのLandscape(横画面)時にレールが画面の横幅いっぱいにフィットするよう、
+        // レール半幅＋ダンパー・端余白から orthographicSize を動的に算出
+        float visibleHalfWidth = halfRail + Mathf.Max(0.05f, RailSideMargin);
+        float targetOrthoSize = visibleHalfWidth / Mathf.Max(0.1f, aspect);
+
+        _mainCamera.orthographicSize = targetOrthoSize;
+
+        // レール(y=0)が画面下端寄りの安定した位置に収まるようカメラY位置を設定
+        float bottomMargin = Mathf.Max(0.20f, targetOrthoSize * Mathf.Clamp(RailBottomMarginRatio, 0.10f, 0.35f));
+        float targetCamY = targetOrthoSize - bottomMargin;
+
+        Vector3 curPos = _mainCamera.transform.position;
+        _mainCamera.transform.position = new Vector3(0f, targetCamY, curPos.z != 0f ? curPos.z : -10f);
     }
 
     private void Start()
