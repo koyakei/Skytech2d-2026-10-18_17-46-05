@@ -22,10 +22,20 @@ public class SkyTechVisualizer : MonoBehaviour
     public float LeadPhaseAdvanceRad = 0.30f;
 
     [Header("=== カメラ水平ロック（逆回転補正）設定 ===")]
-    [Tooltip("iPhoneを傾けた際にカメラを逆回転させ、画面内の鉛直線を実空間の重力鉛直と一致させる")]
-    public bool EnableCameraHorizonLock = true;
+    [Tooltip("iPhoneを傾けた際にカメラを逆回転させ、画面内の鉛直線を実空間の重力鉛直と一致させる（※falseで画面をロールさせず水平固定）")]
+    public bool EnableCameraHorizonLock = false;
     [Tooltip("iPhone傾きに対するカメラ逆回転の追従比率（0.70〜1.00推奨）")]
     [Range(0.0f, 1.0f)] public float CameraHorizonLockRatio = 0.75f;
+
+    [Header("=== 下肢・上体ターゲット角度線表示設定 ===")]
+    [Tooltip("iPhoneチルト(下肢目標ロール角)およびAirPods/体幹制御(上体目標角)のターゲット線を画面内に表示する")]
+    public bool ShowTargetAngleGuides = true;
+    [Tooltip("下肢ターゲット線の太さ")]
+    public float TargetLegLineWidth = 0.038f;
+    [Tooltip("上体ターゲット線の太さ")]
+    public float TargetTrunkLineWidth = 0.038f;
+    [Tooltip("目標姿勢の頭部・股関節リングを表示する")]
+    public bool ShowTargetJointMarkers = true;
 
     [Header("=== レール画面表示・カメラフィッティング設定 ===")]
     [Tooltip("画面端とレールの間の安全余白（メートル: 0.15〜0.30推奨。横幅いっぱいにフィットさせます）")]
@@ -58,6 +68,7 @@ public class SkyTechVisualizer : MonoBehaviour
     private LineRenderer _railLine, _absorberLeft, _absorberRight, _carriageLine, _skiBoardLine;
     private LineRenderer _railTargetLeftTick, _railTargetRightTick; // 追加: レール幅70%の目標ライン目印
     private LineRenderer _legLine, _trunkLine, _hipJointCircle, _headCircle;
+    private LineRenderer _targetLegLine, _targetTrunkLine, _currentToTargetTrunkLine, _targetHipCircle, _targetHeadCircle; // 下肢・上体のターゲット角度指示線
     private LineRenderer _comCircle, _comLine, _lowerComCircle, _upperComCircle, _twoComDistLine;
     private LineRenderer _forceLine, _ghostPeakLine;
 
@@ -300,6 +311,14 @@ public class SkyTechVisualizer : MonoBehaviour
         _trunkLine       = CreateLine("TrunkSegment",   0.075f, new Color(0.9f, 0.9f, 0.95f, 1.0f),   6);
         _hipJointCircle  = CreateLine("HipJoint",       0.025f, new Color(1.0f, 0.8f, 0.2f, 1.0f),    7);
         _headCircle      = CreateLine("HeadCircle",     0.030f, new Color(1.0f, 0.85f, 0.7f, 1.0f),   7);
+
+        // 下肢・上体のターゲット角度指示線（iPhoneチルト / AirPods首かしげ 目標姿勢）
+        _targetLegLine            = CreateLine("TargetLegLine",            TargetLegLineWidth,   new Color(0.15f, 0.95f, 0.55f, 0.85f), 5);
+        _targetTrunkLine          = CreateLine("TargetTrunkLine",          TargetTrunkLineWidth, new Color(1.00f, 0.85f, 0.20f, 0.85f), 6);
+        _currentToTargetTrunkLine = CreateLine("CurrentToTargetTrunkLine", 0.022f,               new Color(1.00f, 0.85f, 0.20f, 0.50f), 6);
+        _targetHipCircle          = CreateLine("TargetHipCircle",          0.022f,               new Color(0.15f, 0.95f, 0.55f, 0.75f), 7);
+        _targetHeadCircle         = CreateLine("TargetHeadCircle",         0.026f,               new Color(1.00f, 0.85f, 0.20f, 0.80f), 8);
+
         _twoComDistLine  = CreateLine("TwoCoMLine",     0.015f, new Color(1.0f, 1.0f, 1.0f, 0.45f),   8);
         _comLine         = CreateLine("CoMLine",        0.015f, new Color(1.0f, 0.95f, 0.2f, 0.45f),  8);
         _lowerComCircle  = CreateLine("LowerCoMCircle", 0.025f, new Color(0.0f, 0.90f, 1.0f, 1.0f),   9);
@@ -492,6 +511,95 @@ public class SkyTechVisualizer : MonoBehaviour
         else
         {
             _ghostPeakLine.positionCount = 0;
+        }
+
+        UpdateTargetAngleGuides(P, H, state, input, cfg);
+    }
+
+    private void UpdateTargetAngleGuides(Vector3 P, Vector3 H, in SimState state, in SimInput input, SkyTechSimConfig cfg)
+    {
+        if (!ShowTargetAngleGuides)
+        {
+            _targetLegLine.positionCount = _targetTrunkLine.positionCount = 0;
+            _currentToTargetTrunkLine.positionCount = 0;
+            _targetHipCircle.positionCount = _targetHeadCircle.positionCount = 0;
+            return;
+        }
+
+        // 1. 下肢ターゲット角度 θ1,target の算出 (iPhone端末ロール角 または ステア指令)
+        float maxRollRad = Mathf.Min(75.0f * Mathf.Deg2Rad, cfg.theta_bootOutRad - 2.0f * Mathf.Deg2Rad);
+        float targetLegRad;
+        if (_controller != null && _controller.UseDeviceTilt && Mathf.Abs(_controller.TargetLegRollDeg) > 0.05f)
+        {
+            targetLegRad = Mathf.Clamp(_controller.TargetLegRollDeg * Mathf.Deg2Rad, -maxRollRad, maxRollRad);
+        }
+        else if (Mathf.Abs(input.phi_steer_cmd) > 0.001f)
+        {
+            targetLegRad = Mathf.Clamp(-input.phi_steer_cmd * maxRollRad + input.phi_lock_cmd, -maxRollRad, maxRollRad);
+        }
+        else
+        {
+            targetLegRad = state.theta1;
+        }
+
+        // 目標下肢方向ベクトル
+        Vector3 targetLegDir = new Vector3(Mathf.Sin(targetLegRad), Mathf.Cos(targetLegRad), 0f);
+        float legLength = (state.l1 > 0.1f) ? state.l1 : cfg.l_eq;
+        Vector3 targetH = P + targetLegDir * legLength;
+
+        // 下肢ターゲット線の描画 (足元 P -> 目標股関節 targetH)
+        _targetLegLine.startWidth = _targetLegLine.endWidth = TargetLegLineWidth;
+        SetLine(_targetLegLine, P, targetH);
+
+        if (ShowTargetJointMarkers)
+        {
+            SetCirclePositions(_targetHipCircle, targetH, 0.038f, 16);
+        }
+        else
+        {
+            _targetHipCircle.positionCount = 0;
+        }
+
+        // 2. 上体ターゲット角度 θ2,target の算出 (AirPods首かしげ角 または 物理ソルバーの体幹目標角)
+        float targetTrunkRad = state.theta2_ref;
+        Vector3 targetTrunkDir = new Vector3(Mathf.Sin(targetTrunkRad), Mathf.Cos(targetTrunkRad), 0f);
+        Vector3 targetHead = targetH + targetTrunkDir * (cfg.l2 * 1.55f);
+
+        // 上体ターゲット線の描画 (目標股関節 targetH -> 目標頭部 targetHead)
+        _targetTrunkLine.startWidth = _targetTrunkLine.endWidth = TargetTrunkLineWidth;
+        SetLine(_targetTrunkLine, targetH, targetHead);
+
+        // 現在の股関節 H からも上体目標角を示す補助線を描画 (今の体幹との角度差を直接比較可能)
+        Vector3 curTargetHead = H + targetTrunkDir * (cfg.l2 * 1.45f);
+        SetLine(_currentToTargetTrunkLine, H, curTargetHead);
+
+        if (ShowTargetJointMarkers)
+        {
+            SetCirclePositions(_targetHeadCircle, targetHead, 0.055f, 18);
+        }
+        else
+        {
+            _targetHeadCircle.positionCount = 0;
+        }
+
+        // 内倒警告または過剰リーンアウトに応じたカラーフィードバック
+        if (_controller != null && _controller.IsOverLeanInWarning)
+        {
+            SetColor(_targetTrunkLine, new Color(1.0f, 0.25f, 0.25f, 0.90f));
+            SetColor(_currentToTargetTrunkLine, new Color(1.0f, 0.25f, 0.25f, 0.60f));
+            SetColor(_targetHeadCircle, new Color(1.0f, 0.25f, 0.25f, 0.90f));
+        }
+        else if (_controller != null && _controller.IsExcessLeanOutActive)
+        {
+            SetColor(_targetTrunkLine, new Color(0.20f, 1.0f, 0.70f, 0.90f));
+            SetColor(_currentToTargetTrunkLine, new Color(0.20f, 1.0f, 0.70f, 0.60f));
+            SetColor(_targetHeadCircle, new Color(0.20f, 1.0f, 0.70f, 0.90f));
+        }
+        else
+        {
+            SetColor(_targetTrunkLine, new Color(1.00f, 0.85f, 0.20f, 0.85f));
+            SetColor(_currentToTargetTrunkLine, new Color(1.00f, 0.85f, 0.20f, 0.45f));
+            SetColor(_targetHeadCircle, new Color(1.00f, 0.85f, 0.20f, 0.80f));
         }
     }
 
