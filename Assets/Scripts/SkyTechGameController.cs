@@ -1,5 +1,8 @@
 using UnityEngine;
 using SkyTechSimulator;
+#if UNITY_IOS && !UNITY_EDITOR
+using System.Runtime.InteropServices;
+#endif
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.Controls;
@@ -22,19 +25,59 @@ public class SkyTechGameController : MonoBehaviour
 
     [Header("=== アシスト・マウス操作設定 ===")]
     public bool AutoAngulationAssist = false;
+    [Tooltip("PC/エディタ用のマウス姿勢制御・頂点誘導。iPhone実機では画面タップによる誤動作を防ぐため無効化されます")]
     public bool UseMouseControl = true;
     public MouseHeightControlMode HeightControlMode = MouseHeightControlMode.VerticalSignedFromCenter;
     public float MouseCenterOffsetY = 0.45f;
 
-    [Header("=== AirPods モーション連携設定 ===")]
-    [Tooltip("AirPodsの傾きモーション（頭のロール角）で角付け角(_lockedHipDeg)を操作する")]
-    public bool UseAirPodsMotion = true;
-    [Tooltip("AirPodsのロール角感度倍率")]
-    [Range(0.5f, 3.0f)] public float AirPodsRollSensitivity = 1.2f;
-    [Tooltip("AirPodsロール角の不感帯（度）")]
-    [Range(0.0f, 5.0f)] public float AirPodsRollDeadzone = 1.0f;
+    [Header("=== AirPods (頭部傾き) × iPhone (画面傾き) デュアル制御設定 ===")]
+    [Tooltip("AirPodsの傾きセンサー(CMHeadphoneMotionManager)による上体・頭部の独立制御を有効にする")]
+    public bool UseAirPodsHeadControl = true;
+    [Tooltip("AirPodsの頭のかしげ角(度)に対するゲーム内の体幹傾き角(θ2)の感度倍率")]
+    [Range(0.8f, 2.5f)] public float AirPodsRollSensitivity = 1.45f;
+    [Tooltip("AirPodsで最大過剰リーンアウト(mouse_lean_out_norm=1)に達するターン外側への首かしげ角 [度]")]
+    public float AirPodsMaxLeanOutDeg = 22.0f;
+    [Tooltip("AirPods傾きの不感帯 [度]")]
+    public float AirPodsDeadzoneDeg = 1.5f;
+    [Tooltip("AirPods傾きの平滑化時定数 [秒]")]
+    public float AirPodsSmoothingTau = 0.06f;
+
+    [Header("=== ストレート内倒超え (オーバーリーンイン) 警告設定 ===")]
+    public bool EnableOverLeanInWarning = true;
+    public float OverLeanInWarnThresholdDeg = 1.5f;
+
+    [Header("=== iPhone 端末チルト (脚ロール θ1) 設定 ===")]
+    [Tooltip("iPhoneの画面傾き(加速度/ジャイロ)による脚ロール角(エッジ角)の操作を有効にする")]
+    public bool UseDeviceTilt = true;
+    public bool UseIosSensorControl { get => UseDeviceTilt; set => UseDeviceTilt = value; }
+    [Range(0.5f, 3.0f)] public float DeviceTiltSensitivity = 1.5f;
+    public float DeviceTiltDeadzoneDeg = 1.5f;
+    public float DeviceTiltSmoothingTau = 0.08f;
     [Tooltip("AirPodsのピッチ角（うなずき）で脚の伸縮を補助する")]
     public bool UseAirPodsPitchForLeg = false;
+
+    // UI表示用テレメトリプロパティ
+    public bool IsAirPodsConnected { get; private set; }
+    public float CurrentHeadRollDeg => _smoothedHeadRollDeg;
+    public float CurrentDesiredTrunkDeg { get; private set; }
+    public bool IsExcessLeanOutActive { get; private set; }
+    public bool IsOverLeanInWarning { get; private set; }
+    public float OverLeanInExcessDeg { get; private set; }
+    public float OverLeanInIntensity { get; private set; }
+    public float CurrentDeviceRollDeg => _smoothedRollDeg;
+
+    private float _neutralHeadRollOffsetDeg;
+    private float _smoothedHeadRollDeg;
+    private float _hapticCooldownTimer;
+    private float _neutralRollOffsetDeg;
+    private float _smoothedRollDeg;
+
+#if UNITY_IOS && !UNITY_EDITOR
+    [DllImport("__Internal")] private static extern void HeadphoneMotion_Start();
+    [DllImport("__Internal")] private static extern void HeadphoneMotion_Stop();
+    [DllImport("__Internal")] private static extern bool HeadphoneMotion_IsActive();
+    [DllImport("__Internal")] private static extern void HeadphoneMotion_GetAttitude(out float roll, out float pitch, out float yaw);
+#endif
 
     public float MouseLeanInLineOffsetY = 2.20f;
     public float MouseLeanInUpRange = 1.75f;
@@ -56,7 +99,7 @@ public class SkyTechGameController : MonoBehaviour
     public float LastTurnPeakCoMDeg { get; private set; }
     public string LastTurnEvaluation { get; private set; } = "READY";
     public bool IsCrashFrozen { get; private set; }
-    public float TargetLegRollDeg => _lockedHipDeg;
+    public float TargetLegRollDeg => UseDeviceTilt ? _smoothedRollDeg : _lockedHipDeg;
 
     private SimState _state;
     private SimInput _input;
@@ -70,6 +113,7 @@ public class SkyTechGameController : MonoBehaviour
     private float _prevAbsDx;
     private bool _hasPrevMouseSample;
     private float _centerReturnPushBoost;
+    private float _prevSteer;
 
     private float _leftRollHoldTimer, _leftRollRepeatTimer;
     private float _rightRollHoldTimer, _rightRollRepeatTimer;
@@ -97,18 +141,104 @@ public class SkyTechGameController : MonoBehaviour
 
     private void Awake()
     {
+        Input.simulateMouseWithTouches = false;
         EnforceUpdatedRanges();
         if (Config == null) Config = ScriptableObject.CreateInstance<SkyTechSimConfig>();
     }
 
+    public void EnableDeviceSensors()
+    {
+        Input.simulateMouseWithTouches = false;
+        Input.gyro.enabled = true;
+        StartAirPodsSensor();
+    }
+
+    private void StartAirPodsSensor()
+    {
+#if UNITY_IOS && !UNITY_EDITOR
+        if (UseAirPodsHeadControl) HeadphoneMotion_Start();
+#else
+        AirPodsMotionManager.Start();
+#endif
+    }
+
+    private void StopAirPodsSensor()
+    {
+#if UNITY_IOS && !UNITY_EDITOR
+        HeadphoneMotion_Stop();
+#else
+        AirPodsMotionManager.Stop();
+#endif
+    }
+
+    private bool TryGetRawAirPodsRollDeg(out float headRollDeg)
+    {
+#if UNITY_IOS && !UNITY_EDITOR
+        if (UseAirPodsHeadControl && HeadphoneMotion_IsActive())
+        {
+            HeadphoneMotion_GetAttitude(out float rollRad, out _, out _);
+            // 右へ首をかしげると正(+)、左へかしげると負(-)
+            headRollDeg = rollRad * Mathf.Rad2Deg;
+            return true;
+        }
+#else
+        if (AirPodsMotionManager.IsActive)
+        {
+            headRollDeg = AirPodsMotionManager.GetRollDeg();
+            return true;
+        }
+#endif
+        headRollDeg = 0f;
+        return false;
+    }
+
+    private float ComputeRawDeviceZRollDeg()
+    {
+#if UNITY_IOS && !UNITY_EDITOR
+        Vector3 acc = Input.acceleration;
+        if (acc.sqrMagnitude > 0.01f)
+        {
+            if (Screen.orientation == ScreenOrientation.LandscapeRight)
+            {
+                return Mathf.Atan2(-acc.x, acc.y) * Mathf.Rad2Deg;
+            }
+            else if (Screen.orientation == ScreenOrientation.LandscapeLeft)
+            {
+                return Mathf.Atan2(acc.x, -acc.y) * Mathf.Rad2Deg;
+            }
+            else
+            {
+                return Mathf.Atan2(-acc.x, -acc.y) * Mathf.Rad2Deg;
+            }
+        }
+#endif
+        return 0f;
+    }
+
+    // CalibrateNeutralTilt() を拡張：iPhoneとAirPodsのゼロ点を同時キャリブレーション
+    public void CalibrateDualSensors()
+    {
+        _neutralRollOffsetDeg = ComputeRawDeviceZRollDeg();
+        _smoothedRollDeg = 0f;
+        if (TryGetRawAirPodsRollDeg(out float rawHead))
+        {
+            _neutralHeadRollOffsetDeg = rawHead;
+        }
+        _smoothedHeadRollDeg = 0f;
+#if UNITY_EDITOR
+        AirPodsMotionManager.Calibrate();
+#endif
+        Debug.Log("<color=#58D68D>[SkyTechGameController] Calibrated Dual Sensors (iPhone & AirPods).</color>");
+    }
+
     private void OnEnable()
     {
-        AirPodsMotionManager.Start();
+        EnableDeviceSensors();
     }
 
     private void OnDisable()
     {
-        AirPodsMotionManager.Stop();
+        StopAirPodsSensor();
     }
 
     private void Start() => ResetSimulation();
@@ -167,7 +297,7 @@ public class SkyTechGameController : MonoBehaviour
 
         if (IsKeyDown(KeyCode.C))
         {
-            AirPodsMotionManager.Calibrate();
+            CalibrateDualSensors();
         }
 
         bool qDown = IsKeyDown(KeyCode.Q), qHeld = IsKeyHeld(KeyCode.Q);
@@ -176,27 +306,58 @@ public class SkyTechGameController : MonoBehaviour
                         || IsKeyDown(KeyCode.X) || IsKeyHeld(KeyCode.X)
                         || (qHeld && eHeld);
 
+        float safeDt = Mathf.Max(1e-4f, Time.deltaTime);
+
 #if UNITY_EDITOR
         float mouseScrollY = 0f;
         try { mouseScrollY = Input.mouseScrollDelta.y; } catch { }
         AirPodsMotionManager.UpdateEditorSimulation(Time.deltaTime, qHeld, eHeld, mouseScrollY);
 #endif
 
-        float airPodsRoll = 0f;
-        float airPodsPitch = 0f;
-        bool hasAirPodsMotion = UseAirPodsMotion && AirPodsMotionManager.IsActive;
-
-        if (hasAirPodsMotion)
+        // 1. iPhone 画面傾き（Z軸ロール）による脚ロール操作 -> マウス互換のステア入力
+        float steerFromPhone = 0f;
+#if UNITY_IOS && !UNITY_EDITOR
+        if (UseDeviceTilt)
         {
-            float rawRoll = AirPodsMotionManager.UpdateAndGetSmoothedRollDeg(Time.deltaTime, 0.06f);
-            airPodsPitch = AirPodsMotionManager.UpdateAndGetSmoothedPitchDeg(Time.deltaTime, 0.08f);
+            float rawDevRoll = ComputeRawDeviceZRollDeg() - _neutralRollOffsetDeg;
+            float absDev = Mathf.Abs(rawDevRoll);
+            float filteredDev = (absDev > DeviceTiltDeadzoneDeg)
+                ? Mathf.Sign(rawDevRoll) * (absDev - DeviceTiltDeadzoneDeg) * DeviceTiltSensitivity
+                : 0f;
+            float alphaDev = safeDt / (Mathf.Max(0.005f, DeviceTiltSmoothingTau) + safeDt);
+            _smoothedRollDeg = Mathf.Lerp(_smoothedRollDeg, filteredDev, alphaDev);
 
-            float absRoll = Mathf.Abs(rawRoll);
-            if (absRoll > AirPodsRollDeadzone)
-            {
-                float effectiveRoll = Mathf.Sign(rawRoll) * (absRoll - AirPodsRollDeadzone) * AirPodsRollSensitivity;
-                airPodsRoll = Mathf.Clamp(effectiveRoll, -75.0f, 75.0f);
-            }
+            // iPhone画面の傾き (最大45°) を正規化ステア入力 [-1, 1] へ滑らかにマッピング
+            float absSmoothDev = Mathf.Abs(_smoothedRollDeg);
+            const float fullTiltDeg = 45.0f;
+            float normTilt = Mathf.Clamp01(absSmoothDev / fullTiltDeg);
+            steerFromPhone = (absSmoothDev > 0.05f) ? Mathf.Sign(_smoothedRollDeg) * Mathf.SmoothStep(0f, 1f, normTilt) : 0f;
+        }
+#endif
+
+        // 2. AirPods 頭部傾きセンサーによる体幹目標角 θ2,ref 取得
+        bool hasRawHead = TryGetRawAirPodsRollDeg(out float rawHeadRoll);
+        IsAirPodsConnected = hasRawHead || (Application.isEditor && AirPodsMotionManager.IsActive);
+
+        if (IsAirPodsConnected)
+        {
+            float headRollDiff = rawHeadRoll - _neutralHeadRollOffsetDeg;
+            float absHead = Mathf.Abs(headRollDiff);
+            float filteredHead = (absHead > AirPodsDeadzoneDeg)
+                ? Mathf.Sign(headRollDiff) * (absHead - AirPodsDeadzoneDeg)
+                : 0f;
+            float alphaHead = safeDt / (Mathf.Max(0.005f, AirPodsSmoothingTau) + safeDt);
+            _smoothedHeadRollDeg = Mathf.Lerp(_smoothedHeadRollDeg, filteredHead, alphaHead);
+            CurrentDesiredTrunkDeg = _smoothedHeadRollDeg * AirPodsRollSensitivity;
+        }
+        else
+        {
+            _smoothedHeadRollDeg = Mathf.Lerp(_smoothedHeadRollDeg, 0f, 10.0f * safeDt);
+            CurrentDesiredTrunkDeg = 0f;
+            IsExcessLeanOutActive = false;
+            IsOverLeanInWarning = false;
+            OverLeanInExcessDeg = 0f;
+            OverLeanInIntensity = 0f;
         }
 
         if (resetActive)
@@ -215,11 +376,11 @@ public class SkyTechGameController : MonoBehaviour
         else
         {
             _input.w_reset = false;
-            if (hasAirPodsMotion && (Mathf.Abs(airPodsRoll) > 0.01f || (!qHeld && !eHeld && !qDown && !eDown)))
-            {
-                _lockedHipDeg = Mathf.Lerp(_lockedHipDeg, airPodsRoll, 16.0f * Time.deltaTime);
-            }
-            else
+            bool deviceTiltDriving = false;
+#if UNITY_IOS && !UNITY_EDITOR
+            deviceTiltDriving = UseDeviceTilt && Mathf.Abs(_smoothedRollDeg) > 0.1f;
+#endif
+            if (!deviceTiltDriving)
             {
                 UpdateRollRepeat(qDown, qHeld, -1f, ref _leftRollHoldTimer, ref _leftRollRepeatTimer);
                 UpdateRollRepeat(eDown, eHeld,  1f, ref _rightRollHoldTimer, ref _rightRollRepeatTimer);
@@ -231,10 +392,11 @@ public class SkyTechGameController : MonoBehaviour
         bool extPressed = IsKeyHeld(KeyCode.Space) || IsKeyHeld(KeyCode.UpArrow);
         bool flexPressed = IsKeyHeld(KeyCode.S);
 
-        if (hasAirPodsMotion && UseAirPodsPitchForLeg)
+        if (UseAirPodsPitchForLeg && IsAirPodsConnected)
         {
-            if (airPodsPitch > 6.0f) extPressed = true;
-            else if (airPodsPitch < -6.0f) flexPressed = true;
+            float pitch = AirPodsMotionManager.GetPitchDeg();
+            if (pitch > 6.0f) extPressed = true;
+            else if (pitch < -6.0f) flexPressed = true;
         }
 
 #if ENABLE_INPUT_SYSTEM
@@ -247,33 +409,138 @@ public class SkyTechGameController : MonoBehaviour
 
         Vector2 mouseWorld = Vector2.zero;
         Vector2 screenCenterWorld = Vector2.zero;
-        bool hasMouseWorld = UseMouseControl && TryGetMouseWorldPosition(out mouseWorld, out screenCenterWorld);
+#if !UNITY_EDITOR && (UNITY_IOS || UNITY_ANDROID)
+        // iPhone実機上ではタップ・タッチによる姿勢制御を完全に無効化（PC/エディタのみ有効）
+        bool hasMouseWorld = false;
+#else
+        bool hasMouseWorld = !Application.isMobilePlatform && UseMouseControl && TryGetMouseWorldPosition(out mouseWorld, out screenCenterWorld);
+#endif
         _input.mouse_world = mouseWorld;
         _input.has_mouse_world = hasMouseWorld;
 
-        float safeDt = Mathf.Max(1e-4f, Time.deltaTime);
         float baseCenterY = screenCenterWorld.y + MouseCenterOffsetY;
         float dy = mouseWorld.y - baseCenterY;
 
-                // 0. 上下基準線からのリーンアウト / 中間(スイートスポット付き) / リーンイン算出
-        if (hasMouseWorld && Config != null)
+        // 3. デュアルチルトによる姿勢・警告計算（AirPods 体幹角 θ2,ref × 脚ロール θ1）
+        if (UseAirPodsHeadControl && IsAirPodsConnected && Config != null)
         {
+            float legRollDeg = (Mathf.Abs(steerFromPhone) > 0.05f) ? steerFromPhone * 45.0f : _state.theta1 * Mathf.Rad2Deg;
+            float activeTurnSign = (Mathf.Abs(legRollDeg) > 1.0f)
+                ? Mathf.Sign(legRollDeg)
+                : ((Mathf.Abs(steerFromPhone) > 0.01f) ? Mathf.Sign(steerFromPhone) : 0f);
+
+            if (activeTurnSign != 0f)
+            {
+                float turnBankDeg = Mathf.Abs(legRollDeg);
+                float trunkInTurnDeg = CurrentDesiredTrunkDeg * activeTurnSign;
+
+                if (trunkInTurnDeg < 0f)
+                {
+                    // (A) ターン外側への首かしげ ＝ 過剰リーンアウト (Excess Lean-Out)
+                    float outwardDeg = -trunkInTurnDeg;
+                    IsExcessLeanOutActive = outwardDeg > 1.0f;
+                    float normOut = Mathf.Clamp01(outwardDeg / Mathf.Max(5.0f, AirPodsMaxLeanOutDeg));
+                    _input.mouse_lean_out_norm = normOut * normOut;
+                    _input.mouse_mid_norm = 0f;
+                    _input.mouse_lean_in_norm = 0f;
+
+                    IsOverLeanInWarning = false;
+                    OverLeanInExcessDeg = 0f;
+                    OverLeanInIntensity = 0f;
+                }
+                else if (trunkInTurnDeg <= turnBankDeg)
+                {
+                    // (B) 鉛直 ～ ストレート内倒 (Mid Zone)
+                    IsExcessLeanOutActive = false;
+                    _input.mouse_lean_out_norm = 0f;
+                    float midRatio = (turnBankDeg > 0.1f) ? Mathf.Clamp01(trunkInTurnDeg / turnBankDeg) : 0f;
+                    float centeredMid = (midRatio - 0.5f) * 2.0f;
+                    float plateauMid = 0.5f + 0.5f * (0.30f * centeredMid + 0.70f * centeredMid * centeredMid * centeredMid);
+                    _input.mouse_mid_norm = Mathf.Clamp01(plateauMid);
+                    _input.mouse_lean_in_norm = 0f;
+
+                    IsOverLeanInWarning = false;
+                    OverLeanInExcessDeg = 0f;
+                    OverLeanInIntensity = 0f;
+                }
+                else
+                {
+                    // (C) ストレート内倒超え ＝ オーバーリーンイン (Over Lean-In)
+                    IsExcessLeanOutActive = false;
+                    _input.mouse_lean_out_norm = 0f;
+                    _input.mouse_mid_norm = 1.0f;
+
+                    float excessDeg = trunkInTurnDeg - turnBankDeg;
+                    OverLeanInExcessDeg = excessDeg;
+                    float rawIn = Mathf.Clamp01(excessDeg / 15.0f);
+                    _input.mouse_lean_in_norm = rawIn * rawIn;
+
+                    if (EnableOverLeanInWarning && excessDeg > OverLeanInWarnThresholdDeg)
+                    {
+                        IsOverLeanInWarning = true;
+                        OverLeanInIntensity = Mathf.Clamp01((excessDeg - OverLeanInWarnThresholdDeg) / 10.0f);
+
+                        _hapticCooldownTimer -= safeDt;
+                        if (_hapticCooldownTimer <= 0f)
+                        {
+                            _hapticCooldownTimer = 0.28f;
+#if UNITY_IOS && !UNITY_EDITOR
+                            Handheld.Vibrate();
+#endif
+                        }
+                    }
+                    else
+                    {
+                        IsOverLeanInWarning = false;
+                        OverLeanInIntensity = 0f;
+                    }
+                }
+            }
+            else
+            {
+                IsExcessLeanOutActive = false;
+                IsOverLeanInWarning = false;
+                OverLeanInExcessDeg = 0f;
+                OverLeanInIntensity = 0f;
+                _input.mouse_lean_out_norm = 0f;
+                _input.mouse_mid_norm = 0f;
+                _input.mouse_lean_in_norm = 0f;
+            }
+
+            if (hasMouseWorld)
+            {
+                float absDx = Mathf.Abs(mouseWorld.x - screenCenterWorld.x);
+                if (_hasPrevMouseSample)
+                {
+                    float inwardSpeed = Mathf.Max(0f, (_prevAbsDx - absDx) / safeDt);
+                    float turnBankGate = Mathf.Clamp01((Mathf.Abs(_state.theta1) * Mathf.Rad2Deg - 8.0f) / 14.0f);
+                    float returnTarget = Mathf.Clamp01((inwardSpeed / 2.2f) * Config.centerReturnPushGain) * turnBankGate;
+                    float rate = (returnTarget > _centerReturnPushBoost) ? 10.0f : 3.2f;
+                    float target = (returnTarget > _centerReturnPushBoost) ? returnTarget : 0f;
+                    _centerReturnPushBoost = Mathf.MoveTowards(_centerReturnPushBoost, target, rate * safeDt);
+                }
+                _prevAbsDx = absDx;
+                _hasPrevMouseSample = true;
+            }
+        }
+        else if (hasMouseWorld && Config != null)
+        {
+            IsExcessLeanOutActive = false;
+            IsOverLeanInWarning = false;
+            OverLeanInExcessDeg = 0f;
+            OverLeanInIntensity = 0f;
+
             float leanInOffset = Mathf.Max(0.50f, MouseLeanInLineOffsetY);
 
             // 中立基準線より下 (dy < 0): 0 -> 1 (鉛直を超えてさらにリーンアウト)
             float rawOut = (dy < 0f) ? Mathf.Clamp01(-dy / Mathf.Max(0.20f, MouseFlexDownRange)) : 0f;
-            _input.mouse_lean_out_norm = rawOut * rawOut; // 境界付近での急変を防ぐ2乗カーブ
+            _input.mouse_lean_out_norm = rawOut * rawOut;
 
-            // 中立基準線 (dy = 0) ～ Lean-in line (dy = leanInOffset) の補間比率 (0..1)
-            // 【改善】中間部分 (0.25 ～ 0.75) の感度を緩やかにするS字プラトー変換
-            // これにより、中間付近でマウスが上下にブレても姿勢がシビアに変動しない
             float rawMid = (dy > 0f) ? Mathf.Clamp01(dy / leanInOffset) : 0f;
-            float centeredMid = (rawMid - 0.5f) * 2.0f; // -1.0 .. +1.0
-            // 中心(0)付近の傾きを30%に抑え、両端近くでのみ100%へ遷移する不感帯プラトー
+            float centeredMid = (rawMid - 0.5f) * 2.0f;
             float plateauMid = 0.5f + 0.5f * (0.30f * centeredMid + 0.70f * centeredMid * centeredMid * centeredMid);
             _input.mouse_mid_norm = Mathf.Clamp01(plateauMid);
 
-            // Lean-in line より上 (dy > leanInOffset): 0 -> 1
             float rawIn = (dy > leanInOffset)
                 ? Mathf.Clamp01((dy - leanInOffset) / Mathf.Max(0.20f, MouseLeanInUpRange))
                 : 0f;
@@ -354,6 +621,10 @@ public class SkyTechGameController : MonoBehaviour
         {
             steer = (kbRight ? 1f : 0f) - (kbLeft ? 1f : 0f);
         }
+        else if (Mathf.Abs(steerFromPhone) > 0.001f)
+        {
+            steer = steerFromPhone;
+        }
         else if (hasMouseWorld)
         {
             float dx = mouseWorld.x - screenCenterWorld.x;
@@ -366,6 +637,15 @@ public class SkyTechGameController : MonoBehaviour
                 float gentleSteer = Mathf.Lerp(normSteer, Mathf.SmoothStep(0f, 1f, normSteer), 0.45f);
                 steer = Mathf.Sign(dx) * gentleSteer;
             }
+        }
+
+        // ターン切り返し（エッジ反転）時の屈曲抜重 (Flexion Unweighting)
+        float steerRate = Mathf.Abs(steer - _prevSteer) / safeDt;
+        _prevSteer = steer;
+        float unweightingFlex = Mathf.Clamp01((steerRate - 1.8f) / 2.5f) * Mathf.Clamp01(1.0f - Mathf.Abs(steer) / 0.35f);
+        if (unweightingFlex > 0.05f && !extPressed && !hasMouseWorld)
+        {
+            _input.u_flex_norm = Mathf.Max(_input.u_flex_norm, unweightingFlex * 0.65f);
         }
 
         bool downHeld = IsKeyHeld(KeyCode.DownArrow);
@@ -418,6 +698,11 @@ public class SkyTechGameController : MonoBehaviour
     public static bool TryGetMouseWorldPosition(out Vector2 worldPos, out Vector2 screenCenterWorld)
     {
         worldPos = screenCenterWorld = Vector2.zero;
+#if !UNITY_EDITOR && (UNITY_IOS || UNITY_ANDROID)
+        // モバイル実機ではタップによるマウス姿勢制御を行わない（PC/Editor限定）
+        return false;
+#else
+        if (Application.isMobilePlatform) return false;
         Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
         if (cam == null) return false;
 
@@ -473,6 +758,7 @@ public class SkyTechGameController : MonoBehaviour
         worldPos = cam.ScreenToWorldPoint(screenPos);
         screenCenterWorld = cam.ScreenToWorldPoint(new Vector3(cam.pixelWidth * 0.5f, cam.pixelHeight * 0.5f, depth));
         return true;
+#endif
     }
 
 #if ENABLE_INPUT_SYSTEM

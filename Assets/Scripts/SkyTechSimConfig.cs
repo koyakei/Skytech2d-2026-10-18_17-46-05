@@ -92,7 +92,8 @@ namespace SkyTechSimulator
         [Range(8.0f, 25.0f)] public float angulationTransitionDeg = 14.0f;
         [Range(0.0f, 2.0f)] public float centerReturnPushGain = 0f;
         [Range(0.1f, 1.5f)] public float transitionReboundGain = 0.60f;
-        [Range(0.0f, 1.0f)] public float mouseForceOverrideRatio = 0.85f;
+        [Tooltip("非物理的な重心強制オーバーライド率 (0: 完全物理・筋トルク制限厳密準拠, 1: 外部強制)")]
+        [Range(0.0f, 1.0f)] public float mouseForceOverrideRatio = 0.0f;
         public float mouseRollMomentGain = 1.80f;
         [Range(0.0f, 0.60f)] public float trunkLeanOutRatio = 0.30f;
         public float comLineNearDist = 0.55f;

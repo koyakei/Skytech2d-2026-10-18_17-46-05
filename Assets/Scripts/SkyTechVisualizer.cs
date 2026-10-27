@@ -21,6 +21,14 @@ public class SkyTechVisualizer : MonoBehaviour
     [Tooltip("位相をどれだけ先回りしてリードするか（ラジアン）")]
     public float LeadPhaseAdvanceRad = 0.30f;
 
+    [Header("=== カメラ水平ロック（逆回転補正）設定 ===")]
+    [Tooltip("iPhoneを傾けた際にカメラを逆回転させ、画面内の鉛直線を実空間の重力鉛直と一致させる")]
+    public bool EnableCameraHorizonLock = true;
+    [Tooltip("iPhone傾きに対するカメラ逆回転の追従比率（0.70〜1.00推奨）")]
+    [Range(0.0f, 1.0f)] public float CameraHorizonLockRatio = 0.75f;
+
+    private Camera _mainCamera;
+
     private float _pacemakerPhase = 0f;
     private float _smoothedTargetDeg = 70.0f;
     private float _currentTurnMaxAbsX = 0f;
@@ -48,7 +56,7 @@ public class SkyTechVisualizer : MonoBehaviour
     private LineRenderer _forceLine, _ghostPeakLine;
 
     private Texture2D _panelBgTex, _barBgTex, _barFillTex, _badgeTex;
-    private GUIStyle _panelStyle, _titleStyle, _labelStyle, _valueStyle, _badgeStyle, _guideStyle, _centerTagStyle;
+    private GUIStyle _panelStyle, _titleStyle, _labelStyle, _valueStyle, _badgeStyle, _guideStyle, _centerTagStyle, _btnStyle;
     private bool _guiInitialized;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -79,19 +87,30 @@ public class SkyTechVisualizer : MonoBehaviour
 
     private void EnsureCameraSetup()
     {
-        Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
-        if (cam == null)
+        _mainCamera = Camera.main ?? Object.FindAnyObjectByType<Camera>();
+        if (_mainCamera == null)
         {
-            cam = new GameObject("Main Camera") { tag = "MainCamera" }.AddComponent<Camera>();
+            _mainCamera = new GameObject("Main Camera") { tag = "MainCamera" }.AddComponent<Camera>();
         }
 
-        cam.orthographic = true;
+        _mainCamera.orthographic = true;
         float halfRail = (_controller != null && _controller.Config != null) ? _controller.Config.W_rail * 0.5f : 3.60f;
-        float aspect = (cam.pixelWidth > 0 && cam.pixelHeight > 0) ? (float)cam.pixelWidth / cam.pixelHeight : (16f / 9f);
-        cam.orthographicSize = Mathf.Max(2.6f, (halfRail + 0.35f) / Mathf.Max(0.5f, aspect));
-        cam.transform.SetPositionAndRotation(new Vector3(0f, 0.85f, -10f), Quaternion.identity);
-        cam.backgroundColor = new Color(0.063f, 0.082f, 0.125f);
-        cam.clearFlags = CameraClearFlags.SolidColor;
+        float aspect = (_mainCamera.pixelWidth > 0 && _mainCamera.pixelHeight > 0) ? (float)_mainCamera.pixelWidth / _mainCamera.pixelHeight : (16f / 9f);
+        _mainCamera.orthographicSize = Mathf.Max(2.6f, (halfRail + 0.35f) / Mathf.Max(0.5f, aspect));
+        _mainCamera.transform.SetPositionAndRotation(new Vector3(0f, 0.85f, -10f), Quaternion.identity);
+        _mainCamera.backgroundColor = new Color(0.063f, 0.082f, 0.125f);
+        _mainCamera.clearFlags = CameraClearFlags.SolidColor;
+    }
+
+    private void UpdateCamera()
+    {
+        if (_mainCamera == null) EnsureCameraSetup();
+        if (_mainCamera == null) return;
+
+        // iPhoneの傾き角の70%〜100%分だけカメラを逆回転させ、ゲーム内の重力鉛直を実空間の鉛直と一致させる
+        float ratio = EnableCameraHorizonLock ? CameraHorizonLockRatio : 0f;
+        float camCounterRoll = (_controller != null && _controller.UseIosSensorControl) ? -_controller.CurrentDeviceRollDeg * ratio : 0f;
+        _mainCamera.transform.rotation = Quaternion.Euler(0f, 0f, camCounterRoll);
     }
 
     private void Start()
@@ -105,6 +124,7 @@ public class SkyTechVisualizer : MonoBehaviour
         if (_controller == null || _controller.Config == null) return;
         SimState state = _controller.CurrentState;
         SimInput input = _controller.CurrentInput;
+        UpdateCamera();
         UpdateRailGeometry();
         UpdateCenterCrosshairGeometry(input);
         UpdateDynamicGeometry(state, input, _controller.Config);
@@ -505,6 +525,7 @@ public class SkyTechVisualizer : MonoBehaviour
         _badgeStyle     = new GUIStyle(GUI.skin.box) { fontSize = 12, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter, normal = { background = _badgeTex, textColor = Color.white } };
         _guideStyle     = new GUIStyle(GUI.skin.label) { fontSize = 11, normal = { textColor = new Color(0.75f, 0.82f, 0.90f) }, alignment = TextAnchor.MiddleCenter, richText = true };
         _centerTagStyle = new GUIStyle(GUI.skin.label) { fontSize = 10, normal = { textColor = new Color(0.65f, 0.82f, 0.98f, 0.65f) }, alignment = TextAnchor.MiddleLeft, richText = true };
+        _btnStyle       = new GUIStyle(GUI.skin.button) { fontSize = 10, fontStyle = FontStyle.Bold };
 
         _guiInitialized = true;
     }
@@ -518,6 +539,100 @@ public class SkyTechVisualizer : MonoBehaviour
         DrawBiomechanicsPanel(_controller.CurrentState, _controller.Config);
         DrawScorePanel();
         DrawControlsGuidePanel();
+        DrawDualTiltHorizonGauge(_controller.CurrentState);
+        DrawOverLeanInWarningBanner();
+    }
+
+    // SkyTechVisualizer.cs の OnGUI() 内から呼び出すデュアルチルトUIバー
+    private void DrawDualTiltHorizonGauge(in SimState state)
+    {
+        float gaugeW = Mathf.Min(460f, Screen.width - 40f);
+        float gaugeH = 44f;
+        float gx = (Screen.width - gaugeW) * 0.5f;
+        float gy = 52f;
+
+        Rect boxRect = new Rect(gx, gy, gaugeW, gaugeH);
+        GUI.Box(boxRect, GUIContent.none, _panelStyle);
+
+        float centerX = gx + gaugeW * 0.5f;
+        float barY = gy + 22f;
+        float barW = gaugeW - 36f;
+        float barLeft = centerX - barW * 0.5f;
+        float halfBarW = barW * 0.5f;
+        const float maxDisplayDeg = 75.0f; // 左右±75°フルスケール
+
+        Color oldCol = GUI.color;
+
+        // 1. ベースレール背景
+        GUI.color = new Color(0.14f, 0.18f, 0.25f, 0.95f);
+        GUI.DrawTexture(new Rect(barLeft, barY - 4f, barW, 8f), _barBgTex);
+
+        // 2. 現在の脚ロール角 θ1 (= ストレート内倒の境界ライン) と 実際の体幹角 θ2
+        float legDeg = state.theta1 * Mathf.Rad2Deg;
+        float trunkDeg = (state.theta1 - state.phi) * Mathf.Rad2Deg;
+
+        float legScreenX = centerX + Mathf.Clamp(legDeg / maxDisplayDeg, -1f, 1f) * halfBarW;
+        float trunkScreenX = centerX + Mathf.Clamp(trunkDeg / maxDisplayDeg, -1f, 1f) * halfBarW;
+
+        // 3. 股関節外傾角 (φ = θ1 - θ2) のブリッジ帯を描画
+        float bridgeLeft = Mathf.Min(legScreenX, trunkScreenX);
+        float bridgeWidth = Mathf.Abs(legScreenX - trunkScreenX);
+        Color bridgeCol = _controller.IsOverLeanInWarning
+            ? new Color(1.0f, 0.20f, 0.20f, 0.85f) // 内倒超過時は赤
+            : (_controller.IsExcessLeanOutActive
+                ? new Color(0.15f, 1.0f, 0.75f, 0.75f) // 過剰リーンアウト時はエメラルド
+                : new Color(0.30f, 0.75f, 1.0f, 0.55f));
+        GUI.color = bridgeCol;
+        GUI.DrawTexture(new Rect(bridgeLeft, barY - 3f, Mathf.Max(2f, bridgeWidth), 6f), _barFillTex);
+
+        // 4. 鉛直 0° センターライン (これよりターン外側なら過剰リーンアウト)
+        GUI.color = new Color(1f, 1f, 1f, 0.85f);
+        GUI.DrawTexture(new Rect(centerX - 1f, barY - 10f, 2f, 20f), _barFillTex);
+
+        // 5. 📱 ストレート内倒リミットバー (脚角 θ1 / iPhone傾き)
+        GUI.color = new Color(0.20f, 0.85f, 1.0f, 1.0f);
+        GUI.DrawTexture(new Rect(legScreenX - 2f, barY - 9f, 4f, 18f), _barFillTex);
+
+        // 6. 🎧 頭部・体幹角マーカー (θ2 / AirPods傾き)
+        Color headCol = _controller.IsOverLeanInWarning
+            ? new Color(1.0f, 0.25f, 0.25f, 1f)
+            : (_controller.IsExcessLeanOutActive ? new Color(0.20f, 1.0f, 0.65f, 1f) : new Color(1.0f, 0.90f, 0.25f, 1f));
+        GUI.color = headCol;
+        GUI.DrawTexture(new Rect(trunkScreenX - 5f, barY - 7f, 10f, 14f), _barFillTex);
+
+        GUI.color = oldCol;
+
+        // 7. ステータス＆角度ラベル表示
+        string sensorTag = _controller.IsAirPodsConnected ? "<color=#58D68D>🎧 AirPods+📱iPhone</color>" : "<color=#85C1E9>📱 iPhone Tilt</color>";
+        string postureState = _controller.IsOverLeanInWarning
+            ? $"<color=#FF4444>⚠ OVER LEAN-IN! (+{_controller.OverLeanInExcessDeg:F1}°)</color>"
+            : (_controller.IsExcessLeanOutActive
+                ? $"<color=#2ECC71>★ EXCESS LEAN-OUT (外側 {Mathf.Abs(trunkDeg):F1}°)</color>"
+                : $"鉛直0°基準 | 頭θ2:{trunkDeg:+0.0;-0.0;0.0}° / 脚θ1:{legDeg:+0.0;-0.0;0.0}°");
+
+        float btnW = 76f;
+        float btnH = 20f;
+        float labelW = gaugeW - btnW - 24f;
+        GUI.Label(new Rect(gx + 10f, gy + 2f, labelW, 18f), $"{sensorTag}   {postureState}", _guideStyle);
+
+        if (GUI.Button(new Rect(gx + gaugeW - btnW - 6f, gy + 2f, btnW, btnH), "ゼロ点補正", _btnStyle))
+        {
+            _controller.CalibrateDualSensors();
+        }
+    }
+
+    private void DrawOverLeanInWarningBanner()
+    {
+        if (!_controller.IsOverLeanInWarning) return;
+
+        float bannerW = 380f;
+        float bannerH = 30f;
+        Rect bannerRect = new Rect((Screen.width - bannerW) * 0.5f, 14f, bannerW, bannerH);
+
+        float flash = (Mathf.Sin(Time.time * 14.0f) + 1.0f) * 0.5f;
+        Color warnColor = Color.Lerp(new Color(0.85f, 0.15f, 0.15f, 0.95f), new Color(1.0f, 0.40f, 0.10f, 0.95f), flash);
+
+        DrawBadge(bannerRect, $"▲ OVER LEAN-IN WARNING! (+{_controller.OverLeanInExcessDeg:F1}°)", warnColor, Color.white);
     }
 
     private void DrawCenterGuideLabels()
@@ -615,20 +730,33 @@ public class SkyTechVisualizer : MonoBehaviour
         DrawProgressBar(new Rect(leftX, curY, contentW, 10), staminaNorm, staminaNorm > 0.35f ? new Color(0.3f, 0.9f, 0.4f) : new Color(0.95f, 0.3f, 0.2f));
         curY += 14;
 
-        bool airPodsActive = AirPodsMotionManager.IsActive;
+        bool airPodsActive = _controller.IsAirPodsConnected;
         string apStatus;
 #if UNITY_EDITOR
         apStatus = airPodsActive ? "<color=#F4D03F>EDITOR SIM</color>" : "<color=#7F8C8D>OFFLINE</color>";
 #else
         apStatus = airPodsActive ? "<color=#58D68D>CONNECTED</color>" : "<color=#7F8C8D>OFFLINE</color>";
 #endif
-        DrawMetricRow(leftX, ref curY, contentW, "AirPods Motion", apStatus);
+        DrawMetricRow(leftX, ref curY, contentW, "Dual Sensor Mode", apStatus);
         if (airPodsActive)
         {
-            float apRoll = AirPodsMotionManager.GetRollDeg();
-            float apPitch = AirPodsMotionManager.GetPitchDeg();
-            DrawMetricRow(leftX, ref curY, contentW, "  Head Roll (左右傾き)", $"{apRoll:+0.0;-0.0;0.0}° [C:初期化]");
-            DrawMetricRow(leftX, ref curY, contentW, "  Head Pitch (うなずき)", $"{apPitch:+0.0;-0.0;0.0}°");
+            float headRoll = _controller.CurrentHeadRollDeg;
+            float trunkDeg = _controller.CurrentDesiredTrunkDeg;
+            DrawMetricRow(leftX, ref curY, contentW, "  Head Roll (AirPods)", $"{headRoll:+0.0;-0.0;0.0}° [C:初期化]");
+            DrawMetricRow(leftX, ref curY, contentW, "  Trunk Target θ2", $"{trunkDeg:+0.0;-0.0;0.0}°");
+
+            if (_controller.IsOverLeanInWarning)
+            {
+                DrawMetricRow(leftX, ref curY, contentW, "  Posture Status", $"<color=#FF3344>▲ OVER LEAN-IN! (+{_controller.OverLeanInExcessDeg:F1}°)</color>");
+            }
+            else if (_controller.IsExcessLeanOutActive)
+            {
+                DrawMetricRow(leftX, ref curY, contentW, "  Posture Status", "<color=#FFA040>▼ EXCESS LEAN-OUT (外傾)</color>");
+            }
+            else
+            {
+                DrawMetricRow(leftX, ref curY, contentW, "  Posture Status", "<color=#58D68D>● BALANCED (適正内倒)</color>");
+            }
         }
         curY += 4;
 
@@ -674,7 +802,7 @@ public class SkyTechVisualizer : MonoBehaviour
             "<color=#FF73BF>[リーンイン線より上]</color> 手動リーンイン   |   <color=#FFA040>[中立線より下]</color> リーンアウト(脚屈曲なし)   |   <color=#58D68D>[Space / ↑ / 中立線より上]</color> 脚伸展   |   <color=#85C1E9>[S]</color> 脚屈曲",
             _guideStyle);
         GUI.Label(new Rect(panelRect.x, panelRect.y + 24, panelW, 18),
-            $"<color=#5DADE2>[マウス左右 / A・D]</color> 頭頂誘導   |   <color=#F4D03F>[Q / E or AirPods傾き]</color> 股関節角({_controller.TargetLegRollDeg:+0;-0;0}°)   |   <color=#58D68D>[C]</color> ゼロ点補正   |   <color=#2ECC71>[W]</color> 直立   |   <color=#E74C3C>[R]</color> リセット",
+            $"<color=#5DADE2>[iPhone傾き/マウス左右/A・D]</color> 脚ロール(θ1)   |   <color=#F4D03F>[AirPods首かしげ/Q・E]</color> 体幹目標(θ2)   |   <color=#58D68D>[C]</color> デュアルゼロ点補正   |   <color=#2ECC71>[W]</color> 直立   |   <color=#E74C3C>[R]</color> リセット",
             _guideStyle);
     }
 
