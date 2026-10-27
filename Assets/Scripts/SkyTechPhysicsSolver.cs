@@ -285,26 +285,31 @@ namespace SkyTechSimulator
 
             float highRollGate = AnalyticClamp01((absTheta1 - 22.0f * Mathf.Deg2Rad) / (25.0f * Mathf.Deg2Rad));
             float fastTurnGate = AnalyticClamp01((Mathf.Abs(s.a_c) / cfg.g - 0.5f) / 1.0f);
-            float manualStraightRelease = AnalyticClamp01((midNorm - 0.65f) / 0.35f);
+            // midNorm が 0.35 (LEAN-IN基準線) を超えたら即座に外傾固定を急解除し、ストレート内倒へ移行させる
+            float manualStraightRelease = AnalyticClamp01((midNorm - 0.35f) / 0.45f);
             float sweetSpotLock = 0.65f * highRollGate * fastTurnGate * (1.0f - manualStraightRelease) * (1.0f - leanInNorm);
             float raw_theta2_mid = Mathf.Lerp(theta2_at_centerLine, theta2_at_leanInLine, midNorm);
             float theta2_mid_target = Mathf.Lerp(raw_theta2_mid, theta2_sweet_spot, sweetSpotLock);
 
             float phi_mid_zone = s.theta1 - theta2_mid_target;
             float phi_extra_lean_out = leanOutNorm * (theta1_des * cfg.trunkLeanOutRatio + s.u_shift_filtered * (phiMax * 0.45f) * (1.0f - deepRollFactor * 0.4f));
-            float phi_extra_lean_in = -leanInNorm * s.u_shift_filtered * phiInMax;
+            // STRAIGHT LINE 以上では、旋回・ステア方向へストレート内倒を超えて深くリーンイン（逆くの字内倒）させる
+            float turnOrSteerSign = SmoothSign(s.u_shift_filtered + 0.65f * Mathf.Sin(s.theta1), 0.05f);
+            float turnOrSteerGate = AnalyticClamp01(SoftMax(Mathf.Abs(s.u_shift_filtered) * 2.2f, Mathf.Abs(s.theta1) / (12.0f * Mathf.Deg2Rad)));
+            float effectivePhiInMax = SoftMax(phiMax, phiInMax * 1.25f);
+            float phi_extra_lean_in = -leanInNorm * turnOrSteerSign * turnOrSteerGate * effectivePhiInMax;
 
             // 通常の目標股関節角（80度未満での制御）
             float phi_normal_target = AnalyticClamp(
                 phi_mid_zone + phi_extra_lean_out + phi_extra_lean_in - input.phi_lock_cmd,
-                -phiMax, phiMax
+                -effectivePhiInMax, effectivePhiInMax
             );
 
             // 80度到達時は外傾成分のみを 0 (ストレート内倒) へ滑らかに収束させる（手動リーンイン操作は妨げない）
             float phi_without_lean_in = AnalyticClamp(phi_mid_zone + phi_extra_lean_out - input.phi_lock_cmd, -phiMax, phiMax);
             float phi_target = (1.0f - gReset) * AnalyticClamp(
                 phi_without_lean_in * (1.0f - straightLockBlend) + phi_extra_lean_in,
-                -phiMax, phiMax
+                -effectivePhiInMax, effectivePhiInMax
             );
 
             s.theta2_ref = s.theta1 - phi_target;
@@ -529,7 +534,7 @@ namespace SkyTechSimulator
             float tau_hip_load = m2_l2 * (cfg.g * Mathf.Sin(theta2_cur) - a_hip_inertial * Mathf.Cos(theta2_cur));
             float tau_hip_ff = (1.0f - gReset) * m2_l2 * (cfg.g * Mathf.Sin(theta2_target) - a_hip_inertial * Mathf.Cos(theta2_target));
 
-            float kp_hip_eff = SoftMax(950.0f, cfg.kp_hip) * (1.0f + 0.85f * shiftActivity + 0.65f * chi_up + 0.65f * hammockEngage + 0.85f * straightLockBlend);
+            float kp_hip_eff = SoftMax(950.0f, cfg.kp_hip) * (1.0f + 0.85f * shiftActivity + 0.65f * chi_up + 0.65f * hammockEngage + 0.85f * straightLockBlend + 1.35f * leanInNorm);
             float postureOmegaFollow = ((1.0f - midNorm) * (1.0f - leanInNorm) + 0.35f * effLeanOut) * (1.0f - straightLockBlend);
             float dphi_target = (1.0f - gReset) * postureOmegaFollow * s.omega1;
             float dphi_error = s.dphi - dphi_target;
@@ -539,15 +544,15 @@ namespace SkyTechSimulator
 
             float I_couple = I2_hip + m2_l2 * s.l1 * cosPhi;
             float tau_hip_pd = kp_hip_eff * (phi_target - s.phi) - kd_hip_eff * dphi_error;
-            float limitTorqueBoost = 1.0f + 0.65f * straightLockBlend;
+            float limitTorqueBoost = 1.0f + 0.65f * straightLockBlend + 0.85f * leanInNorm;
             s.tau_hip_steer = tau_hip_ff + (1.0f - gReset) * AnalyticClamp(tau_hip_pd, -tau_hip_avail_neg * 1.5f * limitTorqueBoost, tau_hip_avail_pos * 1.5f * limitTorqueBoost);
 
             float lockAllowance = Mathf.Abs(input.phi_lock_cmd) * (1.0f - straightLockBlend);
             float allowPos = SoftMax(0.0f, SoftMax(s.theta1, theta1_des)) + lockAllowance + 15.0f * Mathf.Deg2Rad;
             float allowNeg = SoftMin(0.0f, SoftMin(s.theta1, theta1_des)) - lockAllowance - 15.0f * Mathf.Deg2Rad;
             
-            float baseDynMaxPhi = Mathf.Lerp(SoftMin(phiMax, allowPos), phiMax, leanOutNorm + leanInNorm);
-            float baseDynMinPhi = Mathf.Lerp(SoftMax(-phiMax, allowNeg), -phiMax, leanOutNorm + leanInNorm);
+            float baseDynMaxPhi = Mathf.Lerp(SoftMin(effectivePhiInMax, allowPos), effectivePhiInMax, AnalyticClamp01(leanOutNorm + leanInNorm));
+            float baseDynMinPhi = Mathf.Lerp(SoftMax(-effectivePhiInMax, allowNeg), -effectivePhiInMax, AnalyticClamp01(leanOutNorm + leanInNorm));
 
             // 80度に達するにつれて外傾側の可動上限を 0 (ストレート内倒) へ滑らかに絞り込むとともに、
             // 急ロール時の勢いで phi = 0 を通り越してリーンイン(逆屈曲)しないよう反対側も 0 へガードする
@@ -557,8 +562,8 @@ namespace SkyTechSimulator
             float dynMinPhi = baseDynMinPhi * (1.0f - straightLockBlend * negTurnGate);
 
             float allowLeanInAtLimit = leanInNorm;
-            dynMinPhi = Mathf.Lerp(dynMinPhi, SoftMax(dynMinPhi, -allowLeanInAtLimit * phiInMax), straightLockBlend * posTurnGate);
-            dynMaxPhi = Mathf.Lerp(dynMaxPhi, SoftMin(dynMaxPhi,  allowLeanInAtLimit * phiInMax), straightLockBlend * negTurnGate);
+            dynMinPhi = Mathf.Lerp(dynMinPhi, SoftMax(dynMinPhi, -allowLeanInAtLimit * effectivePhiInMax), straightLockBlend * posTurnGate);
+            dynMaxPhi = Mathf.Lerp(dynMaxPhi, SoftMin(dynMaxPhi,  allowLeanInAtLimit * effectivePhiInMax), straightLockBlend * negTurnGate);
 
             float tau_hip_coriolis = -m2_l2 * (2.0f * s.dl1 * s.omega1 * cosPhi + s.l1 * s.omega1 * s.omega1 * sinPhi);
             SolveSecondOrderBoundedExact(

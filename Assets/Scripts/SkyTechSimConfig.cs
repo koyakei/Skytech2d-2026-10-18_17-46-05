@@ -65,7 +65,7 @@ namespace SkyTechSimulator
         [Header("6. Hip Angulation Servo & Roll Damping")]
         public float phi_out_maxDeg = 48.0f;
         public float phi_in_maxDeg = -40.0f;
-        public float hipSteerMaxIsoTorque = 420.0f;
+        public float hipSteerMaxIsoTorque = 1220.0f;
         public float hipMuscleOptLengthL0 = 1.00f;
         public float hipMuscleMinLengthLmin = 0.58f;
         [Range(0.20f, 0.80f)] public float hipMuscleGaussianWidthW = 0.55f;
@@ -76,7 +76,7 @@ namespace SkyTechSimulator
         [Range(0.0f, 1.0f)] public float refVerticalKeepRatio = 0.85f;
         [Range(0.25f, 0.85f)] public float trunkInPhaseRatio = 0.45f;
         public float comShiftRollDriveGain = 1.25f;
-        public float kp_hip = 520.0f;
+        public float kp_hip = 1520.0f;
         public float kd_hip = 58.0f;
         public float tau_hip_max = 320.0f;
         public float dphi_max = 4.5f;

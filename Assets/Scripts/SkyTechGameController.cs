@@ -79,11 +79,19 @@ public class SkyTechGameController : MonoBehaviour
     [DllImport("__Internal")] private static extern void HeadphoneMotion_GetAttitude(out float roll, out float pitch, out float yaw);
 #endif
 
-    public float MouseLeanInLineOffsetY = 2.20f;
-    public float MouseLeanInUpRange = 1.75f;
-    public float MouseExtendUpRange = 2.50f;
+    [Header("=== マウス基準線・姿勢制御オフセット設定 ===")]
+    [Tooltip("LEAN-IN 基準線の高さオフセット [m] (これより上で急激にストレート内倒へ移行)")]
+    public float MouseLeanInLineOffsetY = 1.15f;
 
-    public float MouseFlexDownRange = 0.75f;
+    [Tooltip("ストレート内倒ラインの高さオフセット [m] (LEAN-IN基準線の上に表示。ここで完全に脚と上体が一直線 phi=0 に到達)")]
+    public float MouseStraightLineOffsetY = 2.05f;
+
+    [Tooltip("ストレート内倒ラインより上のオーバーリーンイン範囲 [m] (これより上でストレート内倒以上に深くリーンイン)")]
+    public float MouseLeanInUpRange = 1.00f;
+    public float MouseExtendUpRange = 2.80f;
+
+    [Tooltip("一番下の基準線（リーンアウト下限）の深さオフセット [m]")]
+    public float MouseFlexDownRange = 1.75f;
     public float MouseFullExtendDist = 0.35f;
     public float MouseFullFlexDist = 2.50f;
     public float MouseLineDeadzone = 0.005f;
@@ -127,10 +135,12 @@ public class SkyTechGameController : MonoBehaviour
 
     private void EnforceUpdatedRanges()
     {
-        if (MouseLeanInLineOffsetY < 2.2f) MouseLeanInLineOffsetY = 2.40f;
-        if (MouseLeanInUpRange < 1.5f)     MouseLeanInUpRange = 1.75f;
-        if (MouseExtendUpRange < 2.2f)     MouseExtendUpRange = 2.60f;
-        if (MouseFullFlexDist < 2.0f)      MouseFullFlexDist = 2.50f;
+        if (MouseLeanInLineOffsetY < 0.6f || MouseLeanInLineOffsetY > 1.6f) MouseLeanInLineOffsetY = 1.15f;
+        if (MouseStraightLineOffsetY < MouseLeanInLineOffsetY + 0.4f || MouseStraightLineOffsetY > 2.3f) MouseStraightLineOffsetY = Mathf.Max(1.90f, MouseLeanInLineOffsetY + 0.90f);
+        if (MouseLeanInUpRange < 0.6f || MouseLeanInUpRange > 1.4f) MouseLeanInUpRange = 1.00f;
+        if (MouseExtendUpRange < 2.0f)      MouseExtendUpRange = 2.80f;
+        if (MouseFlexDownRange < 1.2f)      MouseFlexDownRange = 1.75f;
+        if (MouseFullFlexDist < 2.0f)       MouseFullFlexDist = 2.50f;
         if (Config != null && Config.mouseSteerFullRange < 2.50f)
         {
             Config.mouseSteerFullRange = 3.20f;
@@ -422,7 +432,14 @@ public class SkyTechGameController : MonoBehaviour
         float dy = mouseWorld.y - baseCenterY;
 
         // 3. デュアルチルトによる姿勢・警告計算（AirPods 体幹角 θ2,ref × 脚ロール θ1）
-        if (UseAirPodsHeadControl && IsAirPodsConnected && Config != null)
+#if UNITY_IOS && !UNITY_EDITOR
+        bool useAirPodsPosture = UseAirPodsHeadControl && IsAirPodsConnected;
+#else
+        // PC / Unityエディタではマウス姿勢制御(hasMouseWorld)を優先し、Q/EキーでAirPods傾きをシミュレート中のみAirPods側を使用
+        bool editorAirPodsTilting = IsAirPodsConnected && (qHeld || eHeld || Mathf.Abs(_smoothedHeadRollDeg) > 0.25f);
+        bool useAirPodsPosture = UseAirPodsHeadControl && (!hasMouseWorld ? IsAirPodsConnected : editorAirPodsTilting);
+#endif
+        if (useAirPodsPosture && Config != null)
         {
             float legRollDeg = (Mathf.Abs(steerFromPhone) > 0.05f) ? steerFromPhone * 45.0f : _state.theta1 * Mathf.Rad2Deg;
             float activeTurnSign = (Mathf.Abs(legRollDeg) > 1.0f)
@@ -530,21 +547,58 @@ public class SkyTechGameController : MonoBehaviour
             OverLeanInExcessDeg = 0f;
             OverLeanInIntensity = 0f;
 
-            float leanInOffset = Mathf.Max(0.50f, MouseLeanInLineOffsetY);
+            float leanInOffset = Mathf.Max(0.40f, MouseLeanInLineOffsetY);
+            float straightOffset = Mathf.Max(leanInOffset + 0.30f, MouseStraightLineOffsetY);
 
-            // 中立基準線より下 (dy < 0): 0 -> 1 (鉛直を超えてさらにリーンアウト)
-            float rawOut = (dy < 0f) ? Mathf.Clamp01(-dy / Mathf.Max(0.20f, MouseFlexDownRange)) : 0f;
-            _input.mouse_lean_out_norm = rawOut * rawOut;
+            if (dy < 0f)
+            {
+                // 中立基準線より下 (dy < 0): 0 -> 1 (鉛直を超えてさらにリーンアウト)
+                // 一番下の基準線 (MouseFlexDownRange) に向かってリーンアウト
+                float rawOut = Mathf.Clamp01(-dy / Mathf.Max(0.30f, MouseFlexDownRange));
+                _input.mouse_lean_out_norm = rawOut * rawOut;
+                _input.mouse_mid_norm = 0f;
+                _input.mouse_lean_in_norm = 0f;
+                IsExcessLeanOutActive = _input.mouse_lean_out_norm > 0.03f;
+            }
+            else if (dy <= leanInOffset)
+            {
+                // 中立線 〜 LEAN-IN 基準線: 外傾スイートスポットを安定維持 (0 -> 0.35)
+                float tLean = dy / leanInOffset;
+                _input.mouse_lean_out_norm = 0f;
+                _input.mouse_mid_norm = Mathf.Lerp(0f, 0.35f, Mathf.SmoothStep(0f, 1f, tLean));
+                _input.mouse_lean_in_norm = 0f;
+            }
+            else if (dy <= straightOffset)
+            {
+                // ★ LEAN-IN 基準線 〜 ストレート内倒ライン:
+                // LEAN-IN 基準線より上で【より激しくストレート内倒へ急激に引き倒す】区間！
+                float tStraight = Mathf.Clamp01((dy - leanInOffset) / (straightOffset - leanInOffset));
+                // 出だしから急峻に立ち上がるパワフルなカーブ (Pow 0.65)
+                float steepStraight = Mathf.Pow(tStraight, 0.65f);
+                _input.mouse_lean_out_norm = 0f;
+                _input.mouse_mid_norm = Mathf.Lerp(0.35f, 1.0f, steepStraight);
+                _input.mouse_lean_in_norm = 0f;
+            }
+            else
+            {
+                // ★ ストレート内倒ラインより上: ストレート内倒を超えてさらに深くリーンイン（逆くの字内倒）！
+                _input.mouse_lean_out_norm = 0f;
+                _input.mouse_mid_norm = 1.0f; // 完全にストレート内倒到達以上
 
-            float rawMid = (dy > 0f) ? Mathf.Clamp01(dy / leanInOffset) : 0f;
-            float centeredMid = (rawMid - 0.5f) * 2.0f;
-            float plateauMid = 0.5f + 0.5f * (0.30f * centeredMid + 0.70f * centeredMid * centeredMid * centeredMid);
-            _input.mouse_mid_norm = Mathf.Clamp01(plateauMid);
+                float excessY = dy - straightOffset;
+                float rawIn = Mathf.Clamp01(excessY / Mathf.Max(0.20f, MouseLeanInUpRange));
+                // STRAIGHT LINE を超えた瞬間から力強くオーバーリーンインへ立ち上がるカーブ (Pow 0.70)
+                _input.mouse_lean_in_norm = Mathf.Pow(rawIn, 0.70f);
 
-            float rawIn = (dy > leanInOffset)
-                ? Mathf.Clamp01((dy - leanInOffset) / Mathf.Max(0.20f, MouseLeanInUpRange))
-                : 0f;
-            _input.mouse_lean_in_norm = rawIn * rawIn;
+                float maxInDeg = Mathf.Max(40f, Mathf.Abs(Config.phi_in_maxDeg) * 1.25f);
+                OverLeanInExcessDeg = _input.mouse_lean_in_norm * maxInDeg;
+                if (EnableOverLeanInWarning && OverLeanInExcessDeg > OverLeanInWarnThresholdDeg)
+                {
+                    IsOverLeanInWarning = true;
+                    OverLeanInIntensity = Mathf.Clamp01((OverLeanInExcessDeg - OverLeanInWarnThresholdDeg) / 15.0f);
+                }
+            }
+            CurrentDesiredTrunkDeg = _state.theta2_ref * Mathf.Rad2Deg;
 
             float absDx = Mathf.Abs(mouseWorld.x - screenCenterWorld.x);
             if (_hasPrevMouseSample)

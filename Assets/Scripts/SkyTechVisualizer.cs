@@ -7,8 +7,9 @@ public class SkyTechVisualizer : MonoBehaviour
     [Header("=== 画面中央基準・頂点誘導ガイド表示設定 ===")]
     public bool ShowCenterCrosshair = true;
     public bool ShowPuppetApexGuide = true;
-    public float GuideExtendUpRange = 2.75f;
-    public float GuideFlexDownRange = 0.75f;
+    public float GuideExtendUpRange = 2.80f;
+    [Tooltip("一番下の基準線（リーンアウト下限）の深さ [m]")]
+    public float GuideFlexDownRange = 1.75f;
 
     [Header("=== 理想のマウスリード目印（ペースメーカー）設定 ===")]
     public bool ShowIdealMouseLead = true;
@@ -53,7 +54,8 @@ public class SkyTechVisualizer : MonoBehaviour
 
     private void EnforceVisualizerRanges()
     {
-        if (GuideExtendUpRange < 2.0f) GuideExtendUpRange = 2.75f;
+        if (GuideExtendUpRange < 2.0f) GuideExtendUpRange = 2.80f;
+        if (GuideFlexDownRange < 1.2f) GuideFlexDownRange = 1.75f;
     }
 
     private void OnValidate() => EnforceVisualizerRanges();
@@ -61,7 +63,7 @@ public class SkyTechVisualizer : MonoBehaviour
     private SkyTechGameController _controller;
     private Material _lineMaterial;
 
-    private LineRenderer _centerHorizLine, _leanInThresholdLine, _centerVertLine, _centerReticleCircle;
+    private LineRenderer _centerHorizLine, _leanInThresholdLine, _straightThresholdLine, _centerVertLine, _centerReticleCircle;
     private LineRenderer _heightMaxTickLine, _heightMinTickLine, _mouseGuideLine, _mouseCursorCircle;
     private LineRenderer _puppetStringLine, _apexTargetCircle;
     private LineRenderer _idealLeadOuterRing, _idealLeadInnerCore, _idealLeadOrbitLine, _idealLeadTetherLine;
@@ -248,7 +250,7 @@ public class SkyTechVisualizer : MonoBehaviour
         float idealX = centerWorld.x + idealAmpX * holdSin;
 
         // Y座標: 70度の深い内倒・外傾を支えるワイド上下スパン
-        float leanInSpan   = Mathf.Max(2.00f, _controller.MouseLeanInLineOffsetY);
+        float leanInSpan   = Mathf.Max(2.00f, _controller.MouseStraightLineOffsetY);
         float bottomMargin = leanInSpan * 0.12f;
         float midBaseY     = leanInSpan * 0.48f;
         float verticalAmp  = leanInSpan * 0.38f;
@@ -291,13 +293,14 @@ public class SkyTechVisualizer : MonoBehaviour
 
     private void SetupLineRenderers()
     {
-        _centerHorizLine     = CreateLine("CenterHorizGuide",  0.014f, new Color(0.55f, 0.75f, 0.95f, 0.25f), -4);
-        _leanInThresholdLine = CreateLine("LeanInGuideLine",   0.014f, new Color(1.00f, 0.45f, 0.75f, 0.32f), -4);
-        _centerVertLine      = CreateLine("CenterVertGuide",   0.014f, new Color(0.55f, 0.75f, 0.95f, 0.28f), -4);
-        _heightMaxTickLine   = CreateLine("HeightMaxTick",     0.016f, new Color(0.35f, 0.95f, 0.60f, 0.35f), -3);
-        _heightMinTickLine   = CreateLine("HeightMinTick",     0.016f, new Color(1.00f, 0.60f, 0.25f, 0.35f), -3);
-        _centerReticleCircle = CreateLine("CenterReticle",     0.015f, new Color(0.75f, 0.88f, 1.00f, 0.40f), -2);
-        _mouseGuideLine      = CreateLine("MouseGuideLine",    0.012f, new Color(1.00f, 0.90f, 0.40f, 0.30f), -1);
+        _centerHorizLine       = CreateLine("CenterHorizGuide",  0.014f, new Color(0.55f, 0.75f, 0.95f, 0.25f), -4);
+        _leanInThresholdLine   = CreateLine("LeanInGuideLine",   0.014f, new Color(1.00f, 0.45f, 0.75f, 0.32f), -4);
+        _straightThresholdLine = CreateLine("StraightGuideLine", 0.016f, new Color(0.30f, 0.95f, 1.00f, 0.38f), -4);
+        _centerVertLine        = CreateLine("CenterVertGuide",   0.014f, new Color(0.55f, 0.75f, 0.95f, 0.28f), -4);
+        _heightMaxTickLine     = CreateLine("HeightMaxTick",     0.016f, new Color(0.35f, 0.95f, 0.60f, 0.35f), -3);
+        _heightMinTickLine     = CreateLine("HeightMinTick",     0.018f, new Color(1.00f, 0.60f, 0.25f, 0.45f), -3);
+        _centerReticleCircle   = CreateLine("CenterReticle",     0.015f, new Color(0.75f, 0.88f, 1.00f, 0.40f), -2);
+        _mouseGuideLine        = CreateLine("MouseGuideLine",    0.012f, new Color(1.00f, 0.90f, 0.40f, 0.30f), -1);
 
         _railLine            = CreateLine("Rail",           0.035f, new Color(0.40f, 0.45f, 0.55f, 0.8f), 0);
         _railTargetLeftTick  = CreateLine("RailTarget70L",  0.022f, new Color(0.20f, 0.95f, 0.85f, 0.65f), 1);
@@ -389,7 +392,7 @@ public class SkyTechVisualizer : MonoBehaviour
         Camera cam = Camera.main ?? Object.FindAnyObjectByType<Camera>();
         if (!ShowCenterCrosshair || cam == null)
         {
-            _centerHorizLine.positionCount = _leanInThresholdLine.positionCount = _centerVertLine.positionCount = 0;
+            _centerHorizLine.positionCount = _leanInThresholdLine.positionCount = _straightThresholdLine.positionCount = _centerVertLine.positionCount = 0;
             _centerReticleCircle.positionCount = _heightMaxTickLine.positionCount = _heightMinTickLine.positionCount = 0;
             _mouseGuideLine.positionCount = _mouseCursorCircle.positionCount = 0;
             return;
@@ -406,20 +409,29 @@ public class SkyTechVisualizer : MonoBehaviour
 
         float leanInY = centerWorld.y + Mathf.Max(0.02f, _controller.MouseLeanInLineOffsetY);
         SetLine(_leanInThresholdLine, new Vector3(centerWorld.x - orthoW * 0.95f, leanInY, 0f), new Vector3(centerWorld.x + orthoW * 0.95f, leanInY, 0f));
-        SetColor(_leanInThresholdLine, Color.Lerp(new Color(1.00f, 0.45f, 0.75f, 0.28f), new Color(1.00f, 0.30f, 0.65f, 0.85f), input.mouse_lean_in_norm));
+        SetColor(_leanInThresholdLine, Color.Lerp(new Color(1.00f, 0.45f, 0.75f, 0.28f), new Color(1.00f, 0.30f, 0.65f, 0.85f), Mathf.Clamp01((input.mouse_mid_norm - 0.35f) / 0.35f)));
+
+        // ★ ストレート内倒ライン（LEAN-IN 基準線の上方に新設描画）
+        float straightOffset = Mathf.Max(_controller.MouseLeanInLineOffsetY + 0.1f, _controller.MouseStraightLineOffsetY);
+        float straightY = centerWorld.y + straightOffset;
+        SetLine(_straightThresholdLine, new Vector3(centerWorld.x - orthoW * 0.95f, straightY, 0f), new Vector3(centerWorld.x + orthoW * 0.95f, straightY, 0f));
+        Color straightBaseCol = Color.Lerp(new Color(0.25f, 0.90f, 1.00f, 0.32f), new Color(0.35f, 1.00f, 0.60f, 0.90f), input.mouse_mid_norm >= 0.98f ? 1f : input.mouse_mid_norm * 0.7f);
+        Color overLeanCol = new Color(1.00f, 0.35f, 0.25f, 0.95f);
+        SetColor(_straightThresholdLine, Color.Lerp(straightBaseCol, overLeanCol, input.mouse_lean_in_norm));
 
         SetLine(_centerVertLine, new Vector3(centerWorld.x, centerWorld.y - orthoH * 0.95f, 0f), new Vector3(centerWorld.x, centerWorld.y + orthoH * 0.95f, 0f));
         SetColor(_centerVertLine, Color.Lerp(new Color(0.55f, 0.75f, 0.95f, 0.28f), new Color(0.40f, 0.90f, 1.00f, 0.50f), Mathf.Abs(input.phi_steer_cmd)));
 
         SetCirclePositions(_centerReticleCircle, new Vector3(centerWorld.x, centerWorld.y, 0f), 0.055f, 20);
 
-        float tickHalfW = 0.28f;
+        float tickHalfW = 0.45f;
         float upY = centerWorld.y + Mathf.Max(0.05f, GuideExtendUpRange);
         float downY = centerWorld.y - Mathf.Max(0.05f, GuideFlexDownRange);
 
         SetLine(_heightMaxTickLine, new Vector3(centerWorld.x - tickHalfW, upY, 0f), new Vector3(centerWorld.x + tickHalfW, upY, 0f));
         SetColor(_heightMaxTickLine, Color.Lerp(new Color(0.35f, 0.95f, 0.60f, 0.30f), new Color(0.35f, 1.00f, 0.55f, 0.85f), input.u_ext_norm));
 
+        // 一番下の基準線（横幅を広げ、下限位置へ描画）
         SetLine(_heightMinTickLine, new Vector3(centerWorld.x - tickHalfW, downY, 0f), new Vector3(centerWorld.x + tickHalfW, downY, 0f));
         SetColor(_heightMinTickLine, Color.Lerp(new Color(1.00f, 0.60f, 0.25f, 0.30f), new Color(1.00f, 0.55f, 0.15f, 0.90f), input.mouse_lean_out_norm));
 
@@ -778,7 +790,10 @@ public class SkyTechVisualizer : MonoBehaviour
         if (!ShowCenterCrosshair) return;
 
         Camera cam = Camera.main;
-        float cx = Screen.width * 0.5f, cy = Screen.height * 0.5f, leanInScreenY = cy - 45f;
+        float cx = Screen.width * 0.5f, cy = Screen.height * 0.5f;
+        float leanInScreenY = cy - 45f;
+        float straightScreenY = cy - 85f;
+        float downTickScreenY = cy + 55f;
 
         if (cam != null)
         {
@@ -786,13 +801,23 @@ public class SkyTechVisualizer : MonoBehaviour
             wp.y += _controller.MouseCenterOffsetY;
             cy = Screen.height - cam.WorldToScreenPoint(wp).y;
 
-            wp.y += Mathf.Max(0.02f, _controller.MouseLeanInLineOffsetY);
-            leanInScreenY = Screen.height - cam.WorldToScreenPoint(wp).y;
+            Vector3 wpLean = wp;
+            wpLean.y += Mathf.Max(0.02f, _controller.MouseLeanInLineOffsetY);
+            leanInScreenY = Screen.height - cam.WorldToScreenPoint(wpLean).y;
+
+            Vector3 wpStraight = wp;
+            wpStraight.y += Mathf.Max(_controller.MouseLeanInLineOffsetY + 0.1f, _controller.MouseStraightLineOffsetY);
+            straightScreenY = Screen.height - cam.WorldToScreenPoint(wpStraight).y;
+
+            Vector3 wpDown = wp;
+            wpDown.y -= Mathf.Max(0.05f, GuideFlexDownRange);
+            downTickScreenY = Screen.height - cam.WorldToScreenPoint(wpDown).y;
         }
 
-        GUI.Label(new Rect(cx + 10f, leanInScreenY - 18f, 260f, 18f), "<color=#FF73BF>▲ LEAN-IN LINE (これより上で手動リーンイン)</color>", _centerTagStyle);
+        GUI.Label(new Rect(cx + 10f, straightScreenY - 18f, 360f, 18f), "<color=#4DFFA0>★ STRAIGHT LINE (ストレート内倒 / これより上でさらに深くリーンイン)</color>", _centerTagStyle);
+        GUI.Label(new Rect(cx + 10f, leanInScreenY - 18f, 320f, 18f), "<color=#FF73BF>▲ LEAN-IN LINE (これより上で激しくストレート内倒へ移行)</color>", _centerTagStyle);
         GUI.Label(new Rect(cx + 10f, cy - 18f, 260f, 18f), "CENTER (中立基準線 / 基準脚長)", _centerTagStyle);
-        GUI.Label(new Rect(cx + 10f, cy + 4f, 260f, 18f), "<color=#FFA040>▼ これより下でリーンアウト (脚屈曲なし)</color>", _centerTagStyle);
+        GUI.Label(new Rect(cx + 10f, downTickScreenY - 18f, 280f, 18f), "<color=#FFA040>▼ FLEX / LEAN-OUT (下限基準線 / リーンアウト)</color>", _centerTagStyle);
         GUI.Label(new Rect(cx - 140f, cy + 4f, 130f, 18f), "← 左へ頭頂誘導", _centerTagStyle);
     }
 
