@@ -50,6 +50,8 @@ public class SkyTechGameController : MonoBehaviour
     [Tooltip("iPhoneの画面傾き(加速度/ジャイロ)による脚ロール角(エッジ角)の操作を有効にする")]
     public bool UseDeviceTilt = true;
     public bool UseIosSensorControl { get => UseDeviceTilt; set => UseDeviceTilt = value; }
+    [Tooltip("iPhoneのチルト方向を反転する（下肢の倒れる向きを逆にする）")]
+    public bool InvertDeviceTilt = true;
     [Range(0.5f, 3.0f)] public float DeviceTiltSensitivity = 1.5f;
     public float DeviceTiltDeadzoneDeg = 1.5f;
     public float DeviceTiltSmoothingTau = 0.08f;
@@ -107,7 +109,7 @@ public class SkyTechGameController : MonoBehaviour
     public float LastTurnPeakCoMDeg { get; private set; }
     public string LastTurnEvaluation { get; private set; } = "READY";
     public bool IsCrashFrozen { get; private set; }
-    public float TargetLegRollDeg => UseDeviceTilt ? _smoothedRollDeg : _lockedHipDeg;
+    public float TargetLegRollDeg => UseDeviceTilt ? (InvertDeviceTilt ? -_smoothedRollDeg : _smoothedRollDeg) : _lockedHipDeg;
 
     private SimState _state;
     private SimInput _input;
@@ -337,11 +339,12 @@ public class SkyTechGameController : MonoBehaviour
             float alphaDev = safeDt / (Mathf.Max(0.005f, DeviceTiltSmoothingTau) + safeDt);
             _smoothedRollDeg = Mathf.Lerp(_smoothedRollDeg, filteredDev, alphaDev);
 
-            // iPhone画面の傾き (最大45°) を正規化ステア入力 [-1, 1] へ滑らかにマッピング
+            // iPhone画面の傾き (最大45°) を正規化ステア入力 [-1, 1] へ滑らかにマッピング（InvertDeviceTiltで下肢の倒れる向きを反転）
             float absSmoothDev = Mathf.Abs(_smoothedRollDeg);
             const float fullTiltDeg = 45.0f;
             float normTilt = Mathf.Clamp01(absSmoothDev / fullTiltDeg);
-            steerFromPhone = (absSmoothDev > 0.05f) ? Mathf.Sign(_smoothedRollDeg) * Mathf.SmoothStep(0f, 1f, normTilt) : 0f;
+            float legTiltSign = InvertDeviceTilt ? -Mathf.Sign(_smoothedRollDeg) : Mathf.Sign(_smoothedRollDeg);
+            steerFromPhone = (absSmoothDev > 0.05f) ? legTiltSign * Mathf.SmoothStep(0f, 1f, normTilt) : 0f;
         }
 #endif
 
