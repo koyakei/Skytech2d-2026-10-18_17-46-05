@@ -33,8 +33,8 @@ public class SkyTechGameController : MonoBehaviour
     [Header("=== AirPods (頭部傾き) × iPhone (画面傾き) デュアル制御設定 ===")]
     [Tooltip("AirPodsの傾きセンサー(CMHeadphoneMotionManager)による上体・頭部の独立制御を有効にする")]
     public bool UseAirPodsHeadControl = true;
-    [Tooltip("AirPodsの頭のかしげ角(度)に対するゲーム内の体幹傾き角(θ2)の感度倍率")]
-    [Range(0.8f, 2.5f)] public float AirPodsRollSensitivity = 1.45f;
+    [Tooltip("AirPodsの頭のかしげ角(度)に対するゲーム内の体幹傾き角(θ2)の感度倍率（1.0で顔のロール角とゲーム内上体ロール角が1:1で一致）")]
+    [Range(0.5f, 2.0f)] public float AirPodsRollSensitivity = 1.0f;
     [Tooltip("AirPodsで最大過剰リーンアウト(mouse_lean_out_norm=1)に達するターン外側への首かしげ角 [度]")]
     public float AirPodsMaxLeanOutDeg = 22.0f;
     [Tooltip("AirPods傾きの不感帯 [度]")]
@@ -377,6 +377,8 @@ public class SkyTechGameController : MonoBehaviour
         {
             _lockedHipDeg = 0f;
             _input.phi_steer_cmd = 0f;
+            _input.has_theta2_des_cmd = false;
+            _input.theta2_des_cmd = 0f;
             _input.mouse_lean_out_norm = 0f;
             _input.mouse_mid_norm = 0f;
             _input.mouse_lean_in_norm = 0f;
@@ -444,6 +446,13 @@ public class SkyTechGameController : MonoBehaviour
 #endif
         if (useAirPodsPosture && Config != null)
         {
+            // ★ 顔のロール角度をそのまま地面基準の上体絶対ロール目標角 (θ2,des) として入力
+            _input.has_theta2_des_cmd = true;
+            _input.theta2_des_cmd = CurrentDesiredTrunkDeg * Mathf.Deg2Rad;
+            _input.mouse_lean_out_norm = 0f;
+            _input.mouse_mid_norm = 0f;
+            _input.mouse_lean_in_norm = 0f;
+
             float legRollDeg = (Mathf.Abs(steerFromPhone) > 0.05f) ? steerFromPhone * 45.0f : _state.theta1 * Mathf.Rad2Deg;
             float activeTurnSign = (Mathf.Abs(legRollDeg) > 1.0f)
                 ? Mathf.Sign(legRollDeg)
@@ -456,14 +465,9 @@ public class SkyTechGameController : MonoBehaviour
 
                 if (trunkInTurnDeg < 0f)
                 {
-                    // (A) ターン外側への首かしげ ＝ 過剰リーンアウト (Excess Lean-Out)
+                    // (A) ターン外側への首かしげ ＝ リーンアウト
                     float outwardDeg = -trunkInTurnDeg;
                     IsExcessLeanOutActive = outwardDeg > 1.0f;
-                    float normOut = Mathf.Clamp01(outwardDeg / Mathf.Max(5.0f, AirPodsMaxLeanOutDeg));
-                    _input.mouse_lean_out_norm = normOut * normOut;
-                    _input.mouse_mid_norm = 0f;
-                    _input.mouse_lean_in_norm = 0f;
-
                     IsOverLeanInWarning = false;
                     OverLeanInExcessDeg = 0f;
                     OverLeanInIntensity = 0f;
@@ -472,13 +476,6 @@ public class SkyTechGameController : MonoBehaviour
                 {
                     // (B) 鉛直 ～ ストレート内倒 (Mid Zone)
                     IsExcessLeanOutActive = false;
-                    _input.mouse_lean_out_norm = 0f;
-                    float midRatio = (turnBankDeg > 0.1f) ? Mathf.Clamp01(trunkInTurnDeg / turnBankDeg) : 0f;
-                    float centeredMid = (midRatio - 0.5f) * 2.0f;
-                    float plateauMid = 0.5f + 0.5f * (0.30f * centeredMid + 0.70f * centeredMid * centeredMid * centeredMid);
-                    _input.mouse_mid_norm = Mathf.Clamp01(plateauMid);
-                    _input.mouse_lean_in_norm = 0f;
-
                     IsOverLeanInWarning = false;
                     OverLeanInExcessDeg = 0f;
                     OverLeanInIntensity = 0f;
@@ -487,13 +484,8 @@ public class SkyTechGameController : MonoBehaviour
                 {
                     // (C) ストレート内倒超え ＝ オーバーリーンイン (Over Lean-In)
                     IsExcessLeanOutActive = false;
-                    _input.mouse_lean_out_norm = 0f;
-                    _input.mouse_mid_norm = 1.0f;
-
                     float excessDeg = trunkInTurnDeg - turnBankDeg;
                     OverLeanInExcessDeg = excessDeg;
-                    float rawIn = Mathf.Clamp01(excessDeg / 15.0f);
-                    _input.mouse_lean_in_norm = rawIn * rawIn;
 
                     if (EnableOverLeanInWarning && excessDeg > OverLeanInWarnThresholdDeg)
                     {
@@ -522,9 +514,6 @@ public class SkyTechGameController : MonoBehaviour
                 IsOverLeanInWarning = false;
                 OverLeanInExcessDeg = 0f;
                 OverLeanInIntensity = 0f;
-                _input.mouse_lean_out_norm = 0f;
-                _input.mouse_mid_norm = 0f;
-                _input.mouse_lean_in_norm = 0f;
             }
 
             if (hasMouseWorld)
@@ -545,6 +534,8 @@ public class SkyTechGameController : MonoBehaviour
         }
         else if (hasMouseWorld && Config != null)
         {
+            _input.has_theta2_des_cmd = false;
+            _input.theta2_des_cmd = 0f;
             IsExcessLeanOutActive = false;
             IsOverLeanInWarning = false;
             OverLeanInExcessDeg = 0f;
